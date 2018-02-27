@@ -14,7 +14,8 @@ class WriteBuffer;
 struct CollectAliases;
 struct AnalyzeColumns;
 struct AnalyzeLambdas;
-class IFunction;
+struct ExecuteTableFunctions;
+class IFunctionBase;
 class IAggregateFunction;
 
 
@@ -30,10 +31,11 @@ class IAggregateFunction;
   */
 struct TypeAndConstantInference
 {
-    void process(ASTPtr & ast, Context & context,
+    void process(ASTPtr & ast, const Context & context,
         CollectAliases & aliases,
         const AnalyzeColumns & columns,
-        const AnalyzeLambdas & analyze_lambdas);
+        const AnalyzeLambdas & analyze_lambdas,
+        ExecuteTableFunctions & table_functions);
 
     struct ExpressionInfo
     {
@@ -44,7 +46,7 @@ struct TypeAndConstantInference
         DataTypePtr data_type;
         bool is_constant_expression = false;
         Field value;    /// Has meaning if is_constant_expression == true.
-        std::shared_ptr<IFunction> function;
+        std::shared_ptr<IFunctionBase> function;
         std::shared_ptr<IAggregateFunction> aggregate_function;
     };
 

@@ -63,7 +63,7 @@ struct OutputData<StreamUnionMode::ExtraInfo>
   */
 
 template <StreamUnionMode mode = StreamUnionMode::Basic>
-class UnionBlockInputStream : public IProfilingBlockInputStream
+class UnionBlockInputStream final : public IProfilingBlockInputStream
 {
 public:
     using ExceptionCallback = std::function<void()>;
@@ -82,29 +82,17 @@ public:
         children = inputs;
         if (additional_input_at_end)
             children.push_back(additional_input_at_end);
+
+        size_t num_children = children.size();
+        if (num_children > 1)
+        {
+            Block header = children.at(0)->getHeader();
+            for (size_t i = 1; i < num_children; ++i)
+                assertBlocksHaveEqualStructure(children[i]->getHeader(), header, "UNION");
+        }
     }
 
     String getName() const override { return "Union"; }
-
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Union(";
-
-        Strings children_ids(children.size());
-        for (size_t i = 0; i < children.size(); ++i)
-            children_ids[i] = children[i]->getID();
-
-        /// Order does not matter.
-        std::sort(children_ids.begin(), children_ids.end());
-
-        for (size_t i = 0; i < children_ids.size(); ++i)
-            res << (i == 0 ? "" : ", ") << children_ids[i];
-
-        res << ")";
-        return res.str();
-    }
-
 
     ~UnionBlockInputStream() override
     {
@@ -138,6 +126,8 @@ public:
     {
         return doGetBlockExtraInfo();
     }
+
+    Block getHeader() const override { return children.at(0)->getHeader(); }
 
 protected:
     void finalize()
@@ -237,17 +227,13 @@ protected:
     }
 
 private:
-    template<StreamUnionMode mode2 = mode>
-    BlockExtraInfo doGetBlockExtraInfo(typename std::enable_if<mode2 == StreamUnionMode::ExtraInfo>::type * = nullptr) const
+    BlockExtraInfo doGetBlockExtraInfo() const
     {
-        return received_payload.extra_info;
-    }
-
-    template<StreamUnionMode mode2 = mode>
-    BlockExtraInfo doGetBlockExtraInfo(typename std::enable_if<mode2 == StreamUnionMode::Basic>::type * = nullptr) const
-    {
-        throw Exception("Method getBlockExtraInfo is not supported for mode StreamUnionMode::Basic",
-            ErrorCodes::NOT_IMPLEMENTED);
+        if constexpr (mode == StreamUnionMode::ExtraInfo)
+            return received_payload.extra_info;
+        else
+            throw Exception("Method getBlockExtraInfo is not supported for mode StreamUnionMode::Basic",
+                ErrorCodes::NOT_IMPLEMENTED);
     }
 
 private:
@@ -267,33 +253,26 @@ private:
     {
         Handler(Self & parent_) : parent(parent_) {}
 
-        template <StreamUnionMode mode2 = mode>
-        void onBlock(Block & block, size_t thread_num,
-            typename std::enable_if<mode2 == StreamUnionMode::Basic>::type * = nullptr)
+        void onBlock(Block & block, size_t /*thread_num*/)
         {
-            //std::cerr << "pushing block\n";
             parent.output_queue.push(Payload(block));
         }
 
-        template <StreamUnionMode mode2 = mode>
-        void onBlock(Block & block, BlockExtraInfo & extra_info, size_t thread_num,
-            typename std::enable_if<mode2 == StreamUnionMode::ExtraInfo>::type * = nullptr)
+        void onBlock(Block & block, BlockExtraInfo & extra_info, size_t /*thread_num*/)
         {
-            //std::cerr << "pushing block with extra info\n";
             parent.output_queue.push(Payload(block, extra_info));
         }
 
         void onFinish()
         {
-            //std::cerr << "pushing end\n";
             parent.output_queue.push(Payload());
         }
 
-        void onFinishThread(size_t thread_num)
+        void onFinishThread(size_t /*thread_num*/)
         {
         }
 
-        void onException(std::exception_ptr & exception, size_t thread_num)
+        void onException(std::exception_ptr & exception, size_t /*thread_num*/)
         {
             //std::cerr << "pushing exception\n";
 

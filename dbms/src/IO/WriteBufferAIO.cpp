@@ -1,3 +1,5 @@
+#if !(defined(__FreeBSD__) || defined(__APPLE__))
+
 #include <IO/WriteBufferAIO.h>
 #include <Common/ProfileEvents.h>
 
@@ -116,7 +118,7 @@ void WriteBufferAIO::nextImpl()
     request.aio_offset = region_aligned_begin;
 
     /// Send the request.
-    while (io_submit(aio_context.ctx, request_ptrs.size(), &request_ptrs[0]) < 0)
+    while (io_submit(aio_context.ctx, request_ptrs.size(), request_ptrs.data()) < 0)
     {
         if (errno != EINTR)
         {
@@ -181,7 +183,7 @@ bool WriteBufferAIO::waitForAIOCompletion()
 
     CurrentMetrics::Increment metric_increment{CurrentMetrics::Write};
 
-    while (io_getevents(aio_context.ctx, events.size(), events.size(), &events[0], nullptr) < 0)
+    while (io_getevents(aio_context.ctx, events.size(), events.size(), events.data(), nullptr) < 0)
     {
         if (errno != EINTR)
         {
@@ -413,3 +415,5 @@ void WriteBufferAIO::finalize()
 }
 
 }
+
+#endif

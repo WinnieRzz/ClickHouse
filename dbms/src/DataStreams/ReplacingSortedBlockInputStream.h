@@ -16,30 +16,13 @@ class ReplacingSortedBlockInputStream : public MergingSortedBlockInputStream
 {
 public:
     ReplacingSortedBlockInputStream(BlockInputStreams inputs_, const SortDescription & description_,
-        const String & version_column_, size_t max_block_size_)
-        : MergingSortedBlockInputStream(inputs_, description_, max_block_size_),
+        const String & version_column_, size_t max_block_size_, WriteBuffer * out_row_sources_buf_ = nullptr)
+        : MergingSortedBlockInputStream(inputs_, description_, max_block_size_, 0, out_row_sources_buf_),
         version_column(version_column_)
     {
     }
 
     String getName() const override { return "ReplacingSorted"; }
-
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "ReplacingSorted(inputs";
-
-        for (size_t i = 0; i < children.size(); ++i)
-            res << ", " << children[i]->getID();
-
-        res << ", description";
-
-        for (size_t i = 0; i < description.size(); ++i)
-            res << ", " << description[i].getID();
-
-        res << ", version_column, " << version_column << ")";
-        return res.str();
-    }
 
 protected:
     /// Can return 1 more records than max_block_size.
@@ -54,18 +37,24 @@ private:
     /// All data has been read.
     bool finished = false;
 
-    RowRef current_key;            /// Primary key of current row.
-    RowRef next_key;            /// Primary key of next row.
+    /// Primary key of current row.
+    RowRef current_key;
+    /// Primary key of next row.
+    RowRef next_key;
+    /// Last row with maximum version for current primary key.
+    RowRef selected_row;
+    /// Max version for current primary key.
+    UInt64 max_version = 0;
+    /// The position (into current_row_sources) of the row with the highest version.
+    size_t max_pos = 0;
 
-    RowRef selected_row;        /// Last row with maximum version for current primary key.
+    /// Sources of rows with the current primary key.
+    PODArray<RowSourcePart> current_row_sources;
 
-    UInt64 max_version = 0;        /// Max version for current primary key.
-
-    template<class TSortCursor>
-    void merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue);
+    void merge(MutableColumns & merged_columns, std::priority_queue<SortCursor> & queue);
 
     /// Output into result the rows for current primary key.
-    void insertRow(ColumnPlainPtrs & merged_columns, size_t & merged_rows);
+    void insertRow(MutableColumns & merged_columns, size_t & merged_rows);
 };
 
 }

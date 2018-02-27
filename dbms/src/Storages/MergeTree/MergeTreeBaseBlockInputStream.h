@@ -1,4 +1,5 @@
 #pragma once
+
 #include <DataStreams/IProfilingBlockInputStream.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
 #include <Storages/MergeTree/MergeTreeData.h>
@@ -21,6 +22,7 @@ public:
         const String & prewhere_column,
         size_t max_block_size_rows,
         size_t preferred_block_size_bytes,
+        size_t preferred_max_column_in_block_size_bytes,
         size_t min_bytes_to_use_direct_io,
         size_t max_read_buffer_size,
         bool use_uncompressed_cache,
@@ -30,28 +32,27 @@ public:
     ~MergeTreeBaseBlockInputStream() override;
 
 protected:
-
     Block readImpl() override final;
 
     /// Creates new this->task, and initilizes readers
     virtual bool getNewTask() = 0;
 
     /// We will call progressImpl manually.
-    void progress(const Progress & value) override {}
+    void progress(const Progress &) override {}
 
     Block readFromPart();
 
-    void injectVirtualColumns(Block & block);
+    void injectVirtualColumns(Block & block) const;
 
 protected:
-
     MergeTreeData & storage;
 
     ExpressionActionsPtr prewhere_actions;
-    String prewhere_column;
+    String prewhere_column_name;
 
     size_t max_block_size_rows;
     size_t preferred_block_size_bytes;
+    size_t preferred_max_column_in_block_size_bytes;
 
     size_t min_bytes_to_use_direct_io;
     size_t max_read_buffer_size;
@@ -70,7 +71,6 @@ protected:
     MergeTreeReaderPtr reader;
     MergeTreeReaderPtr pre_reader;
 
-    Logger * log;
     size_t max_block_size_marks;
 };
 

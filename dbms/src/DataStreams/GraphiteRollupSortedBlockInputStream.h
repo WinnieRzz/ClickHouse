@@ -135,26 +135,9 @@ public:
 
     String getName() const override { return "GraphiteRollupSorted"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "GraphiteRollupSorted(inputs";
-
-        for (size_t i = 0; i < children.size(); ++i)
-            res << ", " << children[i]->getID();
-
-        res << ", description";
-
-        for (size_t i = 0; i < description.size(); ++i)
-            res << ", " << description[i].getID();
-
-        res << ")";
-        return res.str();
-    }
-
     ~GraphiteRollupSortedBlockInputStream()
     {
-        if (current_pattern)
+        if (aggregate_state_created)
             current_pattern->function->destroy(place_for_aggregate_state.data());
     }
 
@@ -176,36 +159,53 @@ private:
 
     time_t time_of_merge;
 
+    /// No data has been read.
+    bool is_first = true;
+
     /// All data has been read.
     bool finished = false;
 
-    RowRef selected_row;        /// Last row with maximum version for current primary key.
-    UInt64 current_max_version = 0;
+    /* | path | time | rounded_time | version | value | unmodified |
+     * -----------------------------------------------------------------------------------
+     * | A    | 11   | 10           | 1       | 1     | a          |                     |
+     * | A    | 11   | 10           | 3       | 2     | b          |> subgroup(A, 11)    |
+     * | A    | 11   | 10           | 2       | 3     | c          |                     |> group(A, 10)
+     * ----------------------------------------------------------------------------------|>
+     * | A    | 12   | 10           | 0       | 4     | d          |                     |> Outputs (A, 10, avg(2, 5), a)
+     * | A    | 12   | 10           | 1       | 5     | e          |> subgroup(A, 12)    |
+     * -----------------------------------------------------------------------------------
+     * | A    | 21   | 20           | 1       | 6     | f          |
+     * | B    | 11   | 10           | 1       | 7     | g          |
+     * ...
+     */
 
-    bool is_first = true;
-    StringRef current_path;
+    /// Path name of current bucket
+    StringRef current_group_path;
+
+    /// Last row with maximum version for current primary key (time bucket).
+    RowRef current_subgroup_newest_row;
+    UInt64 current_subgroup_max_version = 0;
+
+    /// Time of last read row
     time_t current_time = 0;
     time_t current_time_rounded = 0;
-    StringRef next_path;
-    time_t next_time = 0;
-    time_t next_time_rounded = 0;
 
     const Graphite::Pattern * current_pattern = nullptr;
     std::vector<char> place_for_aggregate_state;
+    bool aggregate_state_created = false; /// Invariant: if true then current_pattern is not NULL.
 
     const Graphite::Pattern * selectPatternForPath(StringRef path) const;
     UInt32 selectPrecision(const Graphite::Retentions & retentions, time_t time) const;
 
 
-    template <typename TSortCursor>
-    void merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue);
+    void merge(MutableColumns & merged_columns, std::priority_queue<SortCursor> & queue);
 
     /// Insert the values into the resulting columns, which will not be changed in the future.
-    template <class TSortCursor>
-    void startNextRow(ColumnPlainPtrs & merged_columns, TSortCursor & cursor);
+    template <typename TSortCursor>
+    void startNextGroup(MutableColumns & merged_columns, TSortCursor & cursor, const Graphite::Pattern * next_pattern);
 
     /// Insert the calculated `time`, `value`, `version` values into the resulting columns by the last group of rows.
-    void finishCurrentRow(ColumnPlainPtrs & merged_columns);
+    void finishCurrentGroup(MutableColumns & merged_columns);
 
     /// Update the state of the aggregate function with the new `value`.
     void accumulateRow(RowRef & row);

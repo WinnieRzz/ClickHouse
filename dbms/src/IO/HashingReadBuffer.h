@@ -6,19 +6,19 @@
 namespace DB
 {
 /*
- * Считает хэш от прочитанных данных. При чтении данные читаются из вложенного ReadBuffer.
- * Мелкие кусочки копируются в собственную память.
+ * Calculates the hash from the read data. When reading, the data is read from the nested ReadBuffer.
+ * Small pieces are copied into its own memory.
  */
 class HashingReadBuffer : public IHashingBuffer<ReadBuffer>
 {
 public:
     HashingReadBuffer(ReadBuffer & in_, size_t block_size = DBMS_DEFAULT_HASHING_BLOCK_SIZE) :
-        in(in_)
+        IHashingBuffer<ReadBuffer>(block_size), in(in_)
     {
         working_buffer = in.buffer();
         pos = in.position();
 
-        /// считаем хэш от уже прочитанных данных
+        /// calculate hash from the data already read
         if (working_buffer.size())
         {
             calculateHash(pos, working_buffer.end() - pos);

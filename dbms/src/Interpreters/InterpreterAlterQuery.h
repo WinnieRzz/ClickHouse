@@ -10,13 +10,13 @@
 namespace DB
 {
 
-/** Позволяет добавить или удалить столбец в таблице.
-  * Также позволяет осуществить манипуляции с партициями таблиц семейства MergeTree.
+/** Allows you add or remove a column in the table.
+  * It also allows you to manipulate the partitions of the MergeTree family tables.
   */
 class InterpreterAlterQuery : public IInterpreter
 {
 public:
-    InterpreterAlterQuery(ASTPtr query_ptr_, const Context & context_);
+    InterpreterAlterQuery(const ASTPtr & query_ptr_, const Context & context_);
 
     BlockIO execute() override;
 
@@ -29,61 +29,50 @@ private:
             ATTACH_PARTITION,
             FETCH_PARTITION,
             FREEZE_PARTITION,
-            RESHARD_PARTITION,
-            DROP_COLUMN,
+            CLEAR_COLUMN,
         };
 
         Type type;
 
-        Field partition;
+        ASTPtr partition;
         Field column_name;
-        bool detach = false; /// true для DETACH PARTITION.
+        bool detach = false; /// true for DETACH PARTITION.
 
-        bool unreplicated = false;
         bool part = false;
 
-        String from; /// Для FETCH PARTITION - путь в ZK к шарду, с которого скачивать партицию.
-
-        /// Для RESHARD PARTITION.
-        Field last_partition;
-        WeightedZooKeeperPaths weighted_zookeeper_paths;
-        ASTPtr sharding_key_expr;
-        bool do_copy = false;
-        Field coordinator;
+        String from; /// For FETCH PARTITION - path in ZK to the shard, from which to download the partition.
 
         /// For FREEZE PARTITION
         String with_name;
 
-        static PartitionCommand dropPartition(const Field & partition, bool detach, bool unreplicated)
+        static PartitionCommand dropPartition(const ASTPtr & partition, bool detach)
         {
             PartitionCommand res;
             res.type = DROP_PARTITION;
             res.partition = partition;
             res.detach = detach;
-            res.unreplicated = unreplicated;
             return res;
         }
 
-        static PartitionCommand dropColumnFromPartition(const Field & partition, const Field & column_name)
+        static PartitionCommand clearColumn(const ASTPtr & partition, const Field & column_name)
         {
             PartitionCommand res;
-            res.type = DROP_COLUMN;
+            res.type = CLEAR_COLUMN;
             res.partition = partition;
             res.column_name = column_name;
             return res;
         }
 
-        static PartitionCommand attachPartition(const Field & partition, bool unreplicated, bool part)
+        static PartitionCommand attachPartition(const ASTPtr & partition, bool part)
         {
             PartitionCommand res;
             res.type = ATTACH_PARTITION;
             res.partition = partition;
-            res.unreplicated = unreplicated;
             res.part = part;
             return res;
         }
 
-        static PartitionCommand fetchPartition(const Field & partition, const String & from)
+        static PartitionCommand fetchPartition(const ASTPtr & partition, const String & from)
         {
             PartitionCommand res;
             res.type = FETCH_PARTITION;
@@ -92,7 +81,7 @@ private:
             return res;
         }
 
-        static PartitionCommand freezePartition(const Field & partition, const String & with_name)
+        static PartitionCommand freezePartition(const ASTPtr & partition, const String & with_name)
         {
             PartitionCommand res;
             res.type = FREEZE_PARTITION;
@@ -100,28 +89,17 @@ private:
             res.with_name = with_name;
             return res;
         }
-
-        static PartitionCommand reshardPartitions(const Field & first_partition_, const Field & last_partition_,
-            const WeightedZooKeeperPaths & weighted_zookeeper_paths_, const ASTPtr & sharding_key_expr_,
-            bool do_copy_, const Field & coordinator_)
-        {
-            PartitionCommand res;
-            res.type = RESHARD_PARTITION;
-            res.partition = first_partition_;
-            res.last_partition = last_partition_;
-            res.weighted_zookeeper_paths = weighted_zookeeper_paths_;
-            res.sharding_key_expr = sharding_key_expr_;
-            res.do_copy = do_copy_;
-            res.coordinator = coordinator_;
-            return res;
-        }
     };
 
-    using PartitionCommands = std::vector<PartitionCommand>;
+    class PartitionCommands : public std::vector<PartitionCommand>
+    {
+    public:
+        void validate(const IStorage * table);
+    };
 
     ASTPtr query_ptr;
 
-    Context context;
+    const Context & context;
 
     static void parseAlter(const ASTAlterQuery::ParameterContainer & params,
         AlterCommands & out_alter_commands, PartitionCommands & out_partition_commands);

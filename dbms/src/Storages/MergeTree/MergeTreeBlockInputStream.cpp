@@ -20,6 +20,7 @@ MergeTreeBlockInputStream::MergeTreeBlockInputStream(
     const MergeTreeData::DataPartPtr & owned_data_part_,
     size_t max_block_size_rows_,
     size_t preferred_block_size_bytes_,
+    size_t preferred_max_column_in_block_size_bytes_,
     Names column_names,
     const MarkRanges & mark_ranges_,
     bool use_uncompressed_cache_,
@@ -33,18 +34,17 @@ MergeTreeBlockInputStream::MergeTreeBlockInputStream(
     size_t part_index_in_query_,
     bool quiet)
     :
-    MergeTreeBaseBlockInputStream{storage_, prewhere_actions_, prewhere_column_, max_block_size_rows_, preferred_block_size_bytes_,
-        min_bytes_to_use_direct_io_, max_read_buffer_size_, use_uncompressed_cache_, save_marks_in_cache_, virt_column_names},
+    MergeTreeBaseBlockInputStream{storage_, prewhere_actions_, prewhere_column_, max_block_size_rows_,
+        preferred_block_size_bytes_, preferred_max_column_in_block_size_bytes_, min_bytes_to_use_direct_io_,
+        max_read_buffer_size_, use_uncompressed_cache_, save_marks_in_cache_, virt_column_names},
     ordered_names{column_names},
     data_part{owned_data_part_},
-    part_columns_lock{new Poco::ScopedReadRWLock(data_part->columns_lock)},
+    part_columns_lock(data_part->columns_lock),
     all_mark_ranges(mark_ranges_),
     part_index_in_query(part_index_in_query_),
     check_columns(check_columns),
     path(data_part->getFullPath())
 {
-    log = &Logger::get("MergeTreeBlockInputStream");
-
     /// Let's estimate total number of rows for progress bar.
     size_t total_rows = 0;
     for (const auto & range : all_mark_ranges)
@@ -59,28 +59,34 @@ MergeTreeBlockInputStream::MergeTreeBlockInputStream(
         : "")
         << " rows starting from " << all_mark_ranges.front().begin * storage.index_granularity);
 
-    setTotalRowsApprox(total_rows);
+    addTotalRowsApprox(total_rows);
+
+    header = storage.getSampleBlockForColumns(ordered_names);
+
+    /// Types may be different during ALTER (when this stream is used to perform an ALTER).
+    /// NOTE: We may use similar code to implement non blocking ALTERs.
+    for (const auto & name_type : data_part->columns)
+    {
+        if (header.has(name_type.name))
+        {
+            auto & elem = header.getByName(name_type.name);
+            if (!elem.type->equals(*name_type.type))
+            {
+                elem.type = name_type.type;
+                elem.column = elem.type->createColumn();
+            }
+        }
+    }
+
+    injectVirtualColumns(header);
 }
 
-String MergeTreeBlockInputStream::getID() const
+
+Block MergeTreeBlockInputStream::getHeader() const
 {
-    std::stringstream res;
-    res << "MergeTree(" << path << ", columns";
-
-    for (const NameAndTypePair & column : columns)
-        res << ", " << column.name;
-
-    if (prewhere_actions)
-        res << ", prewhere, " << prewhere_actions->getID();
-
-    res << ", marks";
-
-    for (size_t i = 0; i < all_mark_ranges.size(); ++i)
-        res << ", " << all_mark_ranges[i].begin << ", " << all_mark_ranges[i].end;
-
-    res << ")";
-    return res.str();
+    return header;
 }
+
 
 bool MergeTreeBlockInputStream::getNewTask()
 try
@@ -113,7 +119,7 @@ try
         const NameSet pre_name_set(pre_column_names.begin(), pre_column_names.end());
         /// If the expression in PREWHERE is not a column of the table, you do not need to output a column with it
         ///  (from storage expect to receive only the columns of the table).
-        remove_prewhere_column = !pre_name_set.count(prewhere_column);
+        remove_prewhere_column = !pre_name_set.count(prewhere_column_name);
 
         Names post_column_names;
         for (const auto & name : column_names)
@@ -150,11 +156,11 @@ try
     std::reverse(remaining_mark_ranges.begin(), remaining_mark_ranges.end());
 
     auto size_predictor = (preferred_block_size_bytes == 0) ? nullptr
-                          : std::make_shared<MergeTreeBlockSizePredictor>(data_part, columns, pre_columns);
+                          : std::make_unique<MergeTreeBlockSizePredictor>(data_part, ordered_names, data_part->storage.getSampleBlock());
 
     task = std::make_unique<MergeTreeReadTask>(data_part, remaining_mark_ranges, part_index_in_query, ordered_names,
                                                column_name_set, columns, pre_columns, remove_prewhere_column, should_reorder,
-                                               size_predictor);
+                                               std::move(size_predictor));
 
     if (!reader)
     {
@@ -194,7 +200,7 @@ void MergeTreeBlockInputStream::finish()
     */
     reader.reset();
     pre_reader.reset();
-    part_columns_lock.reset();
+    part_columns_lock.unlock();
     data_part.reset();
 }
 

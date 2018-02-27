@@ -1,3 +1,5 @@
+#if !(defined(__FreeBSD__) || defined(__APPLE__))
+
 #include <IO/ReadBufferAIO.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
@@ -6,7 +8,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#include <experimental/optional>
+#include <optional>
 
 
 namespace ProfileEvents
@@ -88,7 +90,7 @@ bool ReadBufferAIO::nextImpl()
     if (is_eof)
         return false;
 
-    std::experimental::optional<Stopwatch> watch;
+    std::optional<Stopwatch> watch;
     if (profile_callback)
         watch.emplace(clock_type);
 
@@ -271,7 +273,7 @@ void ReadBufferAIO::finalize()
     bytes_read -= region_left_padding;
 
     /// Ignore redundant bytes on the right.
-    bytes_read = std::min(bytes_read, static_cast<off_t>(requested_byte_count));
+    bytes_read = std::min(static_cast<off_t>(bytes_read), static_cast<off_t>(requested_byte_count));
 
     if (bytes_read > 0)
         fill_buffer.buffer().resize(region_left_padding + bytes_read);
@@ -295,3 +297,5 @@ void ReadBufferAIO::finalize()
 }
 
 }
+
+#endif

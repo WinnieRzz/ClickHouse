@@ -6,12 +6,13 @@
 
 #include <Common/Stopwatch.h>
 
-#include <Core/Progress.h>
+#include <IO/Progress.h>
 
 #include <IO/CompressedReadBuffer.h>
 #include <IO/CompressedWriteBuffer.h>
 #include <IO/ReadBufferFromPocoSocket.h>
 #include <IO/WriteBufferFromPocoSocket.h>
+#include <IO/CompressionSettings.h>
 
 #include <IO/copyData.h>
 
@@ -31,6 +32,7 @@
 
 #include <Common/NetException.h>
 
+
 namespace DB
 {
 
@@ -49,10 +51,10 @@ namespace ErrorCodes
 
 void TCPHandler::runImpl()
 {
-    connection_context = *server.global_context;
+    connection_context = server.context();
     connection_context.setSessionContext(connection_context);
 
-    Settings global_settings = server.global_context->getSettings();
+    Settings global_settings = connection_context.getSettings();
 
     socket().setReceiveTimeout(global_settings.receive_timeout);
     socket().setSendTimeout(global_settings.send_timeout);
@@ -117,11 +119,11 @@ void TCPHandler::runImpl()
     while (1)
     {
         /// We are waiting for a packet from the client. Thus, every `POLL_INTERVAL` seconds check whether we need to shut down.
-        while (!static_cast<ReadBufferFromPocoSocket &>(*in).poll(global_settings.poll_interval * 1000000) && !BaseDaemon::instance().isCancelled())
+        while (!static_cast<ReadBufferFromPocoSocket &>(*in).poll(global_settings.poll_interval * 1000000) && !server.isCancelled())
             ;
 
         /// If we need to shut down, or client disconnects.
-        if (BaseDaemon::instance().isCancelled() || in->eof())
+        if (server.isCancelled() || in->eof())
             break;
 
         Stopwatch watch;
@@ -144,8 +146,7 @@ void TCPHandler::runImpl()
                 continue;
 
             /// Get blocks of temporary tables
-            if (client_revision >= DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES)
-                readData(global_settings);
+            readData(global_settings);
 
             /// Reset the input stream, as we received an empty block while receiving external table data.
             /// So, the stream has been marked as cancelled and we can't read from it anymore.
@@ -257,7 +258,7 @@ void TCPHandler::readData(const Settings & global_settings)
                 break;
 
             /// Do we need to shut down?
-            if (BaseDaemon::instance().isCancelled())
+            if (server.isCancelled())
                 return;
 
             /** Have we waited for data for too long?
@@ -287,7 +288,7 @@ void TCPHandler::processInsertQuery(const Settings & global_settings)
     state.io.out->writePrefix();
 
     /// Send block to the client - table structure.
-    Block block = state.io.out_sample;
+    Block block = state.io.out->getHeader();
     sendData(block);
 
     readData(global_settings);
@@ -302,8 +303,11 @@ void TCPHandler::processOrdinaryQuery()
     if (state.io.in)
     {
         /// Send header-block, to allow client to prepare output format for data to send.
-        if (state.io.in_sample)
-            sendData(state.io.in_sample);
+        {
+            Block header = state.io.in->getHeader();
+            if (header)
+                sendData(header);
+        }
 
         AsynchronousBlockInputStream async_in(state.io.in);
         async_in.readPrefix();
@@ -316,7 +320,7 @@ void TCPHandler::processOrdinaryQuery()
             {
                 if (isQueryCancelled())
                 {
-        /// A package was received requesting to stop execution of the request.
+                    /// A packet was received requesting to stop execution of the request.
                     async_in.cancel();
                     break;
                 }
@@ -338,12 +342,12 @@ void TCPHandler::processOrdinaryQuery()
                 }
             }
 
-        /** If data has run out, we will send the profiling data and total values to
-          * the last zero block to be able to use
-          * this information in the suffix output of stream.
-          * If the request was interrupted, then `sendTotals` and other methods could not be called,
-          *  because we have not read all the data yet,
-          *  and there could be ongoing calculations in other threads at the same time.
+            /** If data has run out, we will send the profiling data and total values to
+              * the last zero block to be able to use
+              * this information in the suffix output of stream.
+              * If the request was interrupted, then `sendTotals` and other methods could not be called,
+              *  because we have not read all the data yet,
+              *  and there could be ongoing calculations in other threads at the same time.
               */
             if (!block && !isQueryCancelled())
             {
@@ -396,7 +400,7 @@ void TCPHandler::processTablesStatusRequest()
 
 void TCPHandler::sendProfileInfo()
 {
-    if (const IProfilingBlockInputStream * input = dynamic_cast<const IProfilingBlockInputStream *>(&*state.io.in))
+    if (const IProfilingBlockInputStream * input = dynamic_cast<const IProfilingBlockInputStream *>(state.io.in.get()))
     {
         writeVarUInt(Protocol::Server::ProfileInfo, *out);
         input->getProfileInfo().write(*out);
@@ -407,17 +411,16 @@ void TCPHandler::sendProfileInfo()
 
 void TCPHandler::sendTotals()
 {
-    if (IProfilingBlockInputStream * input = dynamic_cast<IProfilingBlockInputStream *>(&*state.io.in))
+    if (IProfilingBlockInputStream * input = dynamic_cast<IProfilingBlockInputStream *>(state.io.in.get()))
     {
         const Block & totals = input->getTotals();
 
         if (totals)
         {
-            initBlockOutput();
+            initBlockOutput(totals);
 
             writeVarUInt(Protocol::Server::Totals, *out);
-            if (client_revision >= DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES)
-                writeStringBinary("", *out);
+            writeStringBinary("", *out);
 
             state.block_out->write(totals);
             state.maybe_compressed_out->next();
@@ -429,17 +432,16 @@ void TCPHandler::sendTotals()
 
 void TCPHandler::sendExtremes()
 {
-    if (const IProfilingBlockInputStream * input = dynamic_cast<const IProfilingBlockInputStream *>(&*state.io.in))
+    if (IProfilingBlockInputStream * input = dynamic_cast<IProfilingBlockInputStream *>(state.io.in.get()))
     {
-        const Block & extremes = input->getExtremes();
+        Block extremes = input->getExtremes();
 
         if (extremes)
         {
-            initBlockOutput();
+            initBlockOutput(extremes);
 
             writeVarUInt(Protocol::Server::Extremes, *out);
-            if (client_revision >= DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES)
-                writeStringBinary("", *out);
+            writeStringBinary("", *out);
 
             state.block_out->write(extremes);
             state.maybe_compressed_out->next();
@@ -600,7 +602,7 @@ void TCPHandler::receiveQuery()
     state.stage = QueryProcessingStage::Enum(stage);
 
     readVarUInt(compression, *in);
-    state.compression = Protocol::Compression::Enum(compression);
+    state.compression = static_cast<Protocol::Compression>(compression);
 
     readStringBinary(state.query, *in);
 }
@@ -612,8 +614,7 @@ bool TCPHandler::receiveData()
 
     /// The name of the temporary table for writing data, default to empty string
     String external_table_name;
-    if (client_revision >= DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES)
-        readStringBinary(external_table_name, *in);
+    readStringBinary(external_table_name, *in);
 
     /// Read one block from the network and write it down
     Block block = state.block_in->read();
@@ -628,8 +629,9 @@ bool TCPHandler::receiveData()
             /// If such a table does not exist, create it.
             if (!(storage = query_context.tryGetExternalTable(external_table_name)))
             {
-                NamesAndTypesListPtr columns = std::make_shared<NamesAndTypesList>(block.getColumnsList());
-                storage = StorageMemory::create(external_table_name, columns);
+                NamesAndTypesList columns = block.getNamesAndTypesList();
+                storage = StorageMemory::create(external_table_name, columns, NamesAndTypesList{}, NamesAndTypesList{}, ColumnDefaults{});
+                storage->startup();
                 query_context.addExternalTable(external_table_name, storage);
             }
             /// The data will be written directly to the table.
@@ -660,19 +662,20 @@ void TCPHandler::initBlockInput()
 }
 
 
-void TCPHandler::initBlockOutput()
+void TCPHandler::initBlockOutput(const Block & block)
 {
     if (!state.block_out)
     {
         if (state.compression == Protocol::Compression::Enable)
             state.maybe_compressed_out = std::make_shared<CompressedWriteBuffer>(
-                *out, query_context.getSettingsRef().network_compression_method);
+                *out, CompressionSettings(query_context.getSettingsRef()));
         else
             state.maybe_compressed_out = out;
 
         state.block_out = std::make_shared<NativeBlockOutputStream>(
             *state.maybe_compressed_out,
-            client_revision);
+            client_revision,
+            block.cloneEmpty());
     }
 }
 
@@ -711,13 +714,12 @@ bool TCPHandler::isQueryCancelled()
 }
 
 
-void TCPHandler::sendData(Block & block)
+void TCPHandler::sendData(const Block & block)
 {
-    initBlockOutput();
+    initBlockOutput(block);
 
     writeVarUInt(Protocol::Server::Data, *out);
-    if (client_revision >= DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES)
-        writeStringBinary("", *out);
+    writeStringBinary("", *out);
 
     state.block_out->write(block);
     state.maybe_compressed_out->next();
@@ -776,6 +778,5 @@ void TCPHandler::run()
             throw;
     }
 }
-
 
 }

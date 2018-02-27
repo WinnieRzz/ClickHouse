@@ -8,6 +8,7 @@
 #include <Poco/Exception.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/Stopwatch.h>
+#include <Core/Defines.h>
 
 #include "AvalancheTest.h"  /// Taken from SMHasher.
 
@@ -33,7 +34,7 @@ void setAffinity()
 }
 
 
-static inline __attribute__((__always_inline__)) UInt64 rdtsc()
+static inline ALWAYS_INLINE UInt64 rdtsc()
 {
 #if __x86_64__
     UInt32 a, d;
@@ -193,6 +194,11 @@ static inline size_t tabulation(UInt64 x)
     return res;
 }
 
+static inline size_t _intHash64(UInt64 x)
+{
+    return static_cast<size_t>(intHash64(x));
+}
+
 
 const size_t BUF_SIZE = 1024;
 
@@ -204,7 +210,7 @@ void report(const char * name, size_t n, double elapsed, UInt64 tsc_diff, size_t
     std::cerr << name << std::endl
         << "Done in " << elapsed
         << " (" << n / elapsed << " elem/sec."
-        << ", " << n * sizeof(UInt64) / elapsed / (1 << 30) << " GiB/sec."
+        << ", " << n * sizeof(UInt64) / elapsed / (1ULL << 30) << " GiB/sec."
         << ", " << (tsc_diff * 1.0 / n) << " tick/elem)"
         << "; res = " << res
         << std::endl << std::endl;
@@ -256,7 +262,7 @@ static inline void test(size_t n, const UInt64 * data, const char * name)
 
     /// quality. Methods are taken from SMHasher.
     {
-        auto wrapper = [](const void * blob, const int len, const uint32_t seed, void * out)
+        auto wrapper = [](const void * blob, const int, const uint32_t, void * out)
         {
             *reinterpret_cast<UInt32*>(out) = Func(*reinterpret_cast<const UInt64 *>(blob));
         };
@@ -306,16 +312,16 @@ int main(int argc, char ** argv)
 
     setAffinity();
 
-    if (!method || method == 0) test<identity>        (n, &data[0], "0: identity");
-    if (!method || method == 1) test<intHash32>        (n, &data[0], "1: intHash32");
-    if (!method || method == 2) test<intHash64>        (n, &data[0], "2: intHash64");
-    if (!method || method == 3) test<hash3>            (n, &data[0], "3: two rounds");
-    if (!method || method == 4) test<hash4>            (n, &data[0], "4: two rounds and two variables");
-    if (!method || method == 5) test<hash5>            (n, &data[0], "5: two rounds with less ops");
-    if (!method || method == 6) test<murmurMix>        (n, &data[0], "6: murmur64 mixer");
-    if (!method || method == 7) test<mulShift>        (n, &data[0], "7: mulShift");
-    if (!method || method == 8) test<tabulation>    (n, &data[0], "8: tabulation");
-    if (!method || method == 9) test<crc32Hash>        (n, &data[0], "9: crc32");
+    if (!method || method == 1) test<identity>  (n, &data[0], "0: identity");
+    if (!method || method == 2) test<intHash32> (n, &data[0], "1: intHash32");
+    if (!method || method == 3) test<_intHash64>(n, &data[0], "2: intHash64");
+    if (!method || method == 4) test<hash3>     (n, &data[0], "3: two rounds");
+    if (!method || method == 5) test<hash4>     (n, &data[0], "4: two rounds and two variables");
+    if (!method || method == 6) test<hash5>     (n, &data[0], "5: two rounds with less ops");
+    if (!method || method == 7) test<murmurMix> (n, &data[0], "6: murmur64 mixer");
+    if (!method || method == 8) test<mulShift>  (n, &data[0], "7: mulShift");
+    if (!method || method == 9) test<tabulation>(n, &data[0], "8: tabulation");
+    if (!method || method == 10) test<crc32Hash> (n, &data[0], "9: crc32");
 
     return 0;
 }

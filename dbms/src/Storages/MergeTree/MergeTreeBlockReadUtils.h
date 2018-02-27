@@ -1,6 +1,7 @@
 #pragma once
 #include <Core/NamesAndTypes.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
+#include <Storages/MergeTree/MergeTreeRangeReader.h>
 
 namespace DB
 {
@@ -10,7 +11,7 @@ struct MergeTreeReadTask;
 struct MergeTreeBlockSizePredictor;
 
 using MergeTreeReadTaskPtr = std::unique_ptr<MergeTreeReadTask>;
-using MergeTreeBlockSizePredictorPtr = std::shared_ptr<MergeTreeBlockSizePredictor>;
+using MergeTreeBlockSizePredictorPtr = std::unique_ptr<MergeTreeBlockSizePredictor>;
 
 
 /** If some of the requested columns are not in the part,
@@ -30,7 +31,7 @@ struct MergeTreeReadTask
      *    Specified in reverse order for MergeTreeThreadBlockInputStream's convenience of calling .pop_back(). */
     MarkRanges mark_ranges;
     /// for virtual `part_index` virtual column
-    std::size_t part_index_in_query;
+    size_t part_index_in_query;
     /// ordered list of column names used in this query, allows returning blocks with consistent ordering
     const Names & ordered_names;
     /// used to determine whether column should be filtered during PREWHERE or WHERE
@@ -45,12 +46,19 @@ struct MergeTreeReadTask
     const bool should_reorder;
     /// Used to satistfy preferred_block_size_bytes limitation
     MergeTreeBlockSizePredictorPtr size_predictor;
+    /// used to save current range processing status
+    std::optional<MergeTreeRangeReader> current_range_reader;
+    /// the number of rows wasn't read by range_reader if condition in prewhere was false
+    /// helps to skip graunule if all conditions will be aslo false
+    size_t number_of_rows_to_skip;
+
+    bool isFinished() const { return mark_ranges.empty() && !current_range_reader; }
 
     MergeTreeReadTask(
-        const MergeTreeData::DataPartPtr & data_part, const MarkRanges & mark_ranges, const std::size_t part_index_in_query,
+        const MergeTreeData::DataPartPtr & data_part, const MarkRanges & mark_ranges, const size_t part_index_in_query,
         const Names & ordered_names, const NameSet & column_name_set, const NamesAndTypesList & columns,
         const NamesAndTypesList & pre_columns, const bool remove_prewhere_column, const bool should_reorder,
-        const MergeTreeBlockSizePredictorPtr & size_predictor);
+        MergeTreeBlockSizePredictorPtr && size_predictor);
 
     virtual ~MergeTreeReadTask();
 };
@@ -58,10 +66,7 @@ struct MergeTreeReadTask
 
 struct MergeTreeBlockSizePredictor
 {
-    MergeTreeBlockSizePredictor(
-        const MergeTreeData::DataPartPtr & data_part_,
-        const NamesAndTypesList & columns,
-        const NamesAndTypesList & pre_columns);
+    MergeTreeBlockSizePredictor(const MergeTreeData::DataPartPtr & data_part_, const Names & columns, const Block & sample_block);
 
     /// Reset some values for correct statistics calculating
     void startBlock();
@@ -75,11 +80,21 @@ struct MergeTreeBlockSizePredictor
         return block_size_bytes;
     }
 
-    /// Predicts what number of rows should be read to exhaust byte quota
+
+    /// Predicts what number of rows should be read to exhaust byte quota per column
+    inline size_t estimateNumRowsForMaxSizeColumn(size_t bytes_quota) const
+    {
+        double max_size_per_row = std::max<double>(std::max<size_t>(max_size_per_row_fixed, 1), max_size_per_row_dynamic);
+        return (bytes_quota > block_size_rows * max_size_per_row)
+            ? static_cast<size_t>(bytes_quota / max_size_per_row) - block_size_rows
+            : 0;
+    }
+
+    /// Predicts what number of rows should be read to exhaust byte quota per block
     inline size_t estimateNumRows(size_t bytes_quota) const
     {
         return (bytes_quota > block_size_bytes)
-            ? static_cast<size_t>((bytes_quota - block_size_bytes) / bytes_per_row_current)
+            ? static_cast<size_t>((bytes_quota - block_size_bytes) / std::max<size_t>(1, bytes_per_row_current))
             : 0;
     }
 
@@ -87,6 +102,15 @@ struct MergeTreeBlockSizePredictor
     inline size_t estimateNumMarks(size_t bytes_quota, size_t index_granularity) const
     {
         return (estimateNumRows(bytes_quota) + index_granularity / 2) / index_granularity;
+    }
+
+    inline void updateFilteredRowsRation(size_t rows_was_read, size_t rows_was_filtered, double decay = DECAY())
+    {
+        double alpha = std::pow(1. - decay, rows_was_read);
+        double current_ration = rows_was_filtered / std::max<double>(1, rows_was_read);
+        filtered_rows_ratio = current_ration < filtered_rows_ratio
+            ? current_ration
+            : alpha * filtered_rows_ratio + (1.0 - alpha) * current_ration;
     }
 
     /// Aggressiveness of bytes_per_row updates. See update() implementation.
@@ -110,6 +134,15 @@ protected:
     std::vector<ColumnInfo> dynamic_columns_infos;
     size_t fixed_columns_bytes_per_row = 0;
 
+    size_t max_size_per_row_fixed = 0;
+    double max_size_per_row_dynamic = 0;
+
+    size_t number_of_rows_in_part;
+
+    bool is_initialized_in_update = false;
+
+    void initialize(const Block & sample_block, const Names & columns, bool from_update = false);
+
 public:
 
     size_t block_size_bytes = 0;
@@ -118,6 +151,8 @@ public:
     /// Total statistics
     double bytes_per_row_current = 0;
     double bytes_per_row_global = 0;
+
+    double filtered_rows_ratio = 0;
 };
 
 }

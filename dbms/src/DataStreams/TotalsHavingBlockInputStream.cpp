@@ -1,8 +1,12 @@
 #include <DataStreams/TotalsHavingBlockInputStream.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/AggregateDescription.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/FilterDescription.h>
+#include <Common/typeid_cast.h>
+
 
 namespace DB
 {
@@ -15,8 +19,8 @@ namespace ErrorCodes
 
 
 TotalsHavingBlockInputStream::TotalsHavingBlockInputStream(
-    BlockInputStreamPtr input_,
-    bool overflow_row_, ExpressionActionsPtr expression_,
+    const BlockInputStreamPtr & input_,
+    bool overflow_row_, const ExpressionActionsPtr & expression_,
     const std::string & filter_column_, TotalsMode totals_mode_, double auto_include_threshold_)
     : overflow_row(overflow_row_),
     expression(expression_), filter_column_name(filter_column_), totals_mode(totals_mode_),
@@ -26,31 +30,24 @@ TotalsHavingBlockInputStream::TotalsHavingBlockInputStream(
 }
 
 
-String TotalsHavingBlockInputStream::getID() const
-{
-    std::stringstream res;
-    res << "TotalsHavingBlockInputStream(" << children.back()->getID()
-        << "," << filter_column_name << ")";
-    return res.str();
-}
-
-
 static void finalize(Block & block)
 {
     for (size_t i = 0; i < block.columns(); ++i)
     {
         ColumnWithTypeAndName & current = block.safeGetByPosition(i);
-        ColumnAggregateFunction * unfinalized_column = typeid_cast<ColumnAggregateFunction *>(&*current.column);
-        if (unfinalized_column)
+        const DataTypeAggregateFunction * unfinalized_type = typeid_cast<const DataTypeAggregateFunction *>(current.type.get());
+
+        if (unfinalized_type)
         {
-            current.type = unfinalized_column->getAggregateFunction()->getReturnType();
-            current.column = unfinalized_column->convertToValues();
+            current.type = unfinalized_type->getReturnType();
+            if (current.column)
+                current.column = typeid_cast<const ColumnAggregateFunction &>(*current.column).convertToValues();
         }
     }
 }
 
 
-const Block & TotalsHavingBlockInputStream::getTotals()
+Block TotalsHavingBlockInputStream::getTotals()
 {
     if (!totals)
     {
@@ -63,17 +60,27 @@ const Block & TotalsHavingBlockInputStream::getTotals()
                 || totals_mode == TotalsMode::AFTER_HAVING_INCLUSIVE
                 || (totals_mode == TotalsMode::AFTER_HAVING_AUTO
                     && static_cast<double>(passed_keys) / total_keys >= auto_include_threshold))
-                addToTotals(current_totals, overflow_aggregates, nullptr);
+                addToTotals(overflow_aggregates, nullptr);
         }
 
-        finalize(current_totals);
-        totals = current_totals;
+        totals = children.at(0)->getHeader().cloneWithColumns(std::move(current_totals));
+        finalize(totals);
     }
 
     if (totals && expression)
         expression->execute(totals);
 
     return totals;
+}
+
+
+Block TotalsHavingBlockInputStream::getHeader() const
+{
+    Block res = children.at(0)->getHeader();
+    finalize(res);
+    if (expression)
+        expression->execute(res);
+    return res;
 }
 
 
@@ -103,7 +110,7 @@ Block TotalsHavingBlockInputStream::readImpl()
 
         if (filter_column_name.empty())
         {
-            addToTotals(current_totals, block, nullptr);
+            addToTotals(block, nullptr);
         }
         else
         {
@@ -113,23 +120,16 @@ Block TotalsHavingBlockInputStream::readImpl()
             size_t filter_column_pos = finalized.getPositionByName(filter_column_name);
             ColumnPtr filter_column_ptr = finalized.safeGetByPosition(filter_column_pos).column;
 
-            ColumnConstUInt8 * column_const = typeid_cast<ColumnConstUInt8 *>(&*filter_column_ptr);
-            if (column_const)
-                filter_column_ptr = column_const->convertToFullColumn();
+            if (ColumnPtr materialized = filter_column_ptr->convertToFullColumnIfConst())
+                filter_column_ptr = materialized;
 
-            ColumnUInt8 * filter_column = typeid_cast<ColumnUInt8 *>(&*filter_column_ptr);
-            if (!filter_column)
-                throw Exception("Filter column must have type UInt8, found " +
-                    finalized.safeGetByPosition(filter_column_pos).type->getName(),
-                    ErrorCodes::ILLEGAL_TYPE_OF_COLUMN_FOR_FILTER);
-
-            IColumn::Filter & filter = filter_column->getData();
+            FilterDescription filter_description(*filter_column_ptr);
 
             /// Add values to `totals` (if it was not already done).
             if (totals_mode == TotalsMode::BEFORE_HAVING)
-                addToTotals(current_totals, block, nullptr);
+                addToTotals(block, nullptr);
             else
-                addToTotals(current_totals, block, &filter);
+                addToTotals(block, filter_description.data);
 
             /// Filter the block by expression in HAVING.
             size_t columns = finalized.columns();
@@ -137,7 +137,7 @@ Block TotalsHavingBlockInputStream::readImpl()
             for (size_t i = 0; i < columns; ++i)
             {
                 ColumnWithTypeAndName & current_column = finalized.safeGetByPosition(i);
-                current_column.column = current_column.column->filter(filter, -1);
+                current_column.column = current_column.column->filter(*filter_description.data, -1);
                 if (current_column.column->empty())
                 {
                     finalized.clear();
@@ -154,26 +154,26 @@ Block TotalsHavingBlockInputStream::readImpl()
     }
 }
 
-void TotalsHavingBlockInputStream::addToTotals(Block & totals, Block & block, const IColumn::Filter * filter)
-{
-    bool init = !totals;
 
-    ArenaPtr arena;
-    if (init)
+void TotalsHavingBlockInputStream::addToTotals(const Block & block, const IColumn::Filter * filter)
+{
+    bool need_init = !arena;
+
+    if (need_init)
         arena = std::make_shared<Arena>();
 
-    for (size_t i = 0; i < block.columns(); ++i)
+    for (size_t i = 0, num_columns = block.columns(); i < num_columns; ++i)
     {
         const ColumnWithTypeAndName & current = block.safeGetByPosition(i);
-        const ColumnAggregateFunction * column = typeid_cast<const ColumnAggregateFunction *>(&*current.column);
+        const ColumnAggregateFunction * column = typeid_cast<const ColumnAggregateFunction *>(current.column.get());
 
         if (!column)
         {
-            if (init)
+            if (need_init)
             {
-                ColumnPtr new_column = current.type->createColumn();
-                new_column->insert(current.type->getDefault());
-                totals.insert(ColumnWithTypeAndName(new_column, current.type, current.name));
+                MutableColumnPtr new_column = current.type->createColumn();
+                current.type->insertDefaultInto(*new_column);
+                current_totals.emplace_back(std::move(new_column));
             }
             continue;
         }
@@ -181,27 +181,29 @@ void TotalsHavingBlockInputStream::addToTotals(Block & totals, Block & block, co
         IAggregateFunction * function;
         AggregateDataPtr data;
 
-        if (init)
+        /// Create ColumnAggregateFunction with one value.
+
+        if (need_init)
         {
             function = column->getAggregateFunction().get();
-            auto target = std::make_shared<ColumnAggregateFunction>(column->getAggregateFunction(), Arenas(1, arena));
-            totals.insert(ColumnWithTypeAndName(target, current.type, current.name));
+            auto target = ColumnAggregateFunction::create(column->getAggregateFunction(), Arenas(1, arena));
 
             data = arena->alloc(function->sizeOfData());
             function->create(data);
             target->getData().push_back(data);
+
+            current_totals.emplace_back(std::move(target));
         }
         else
         {
-            auto target = typeid_cast<ColumnAggregateFunction *>(totals.safeGetByPosition(i).column.get());
-            if (!target)
-                throw Exception("Unexpected type of column: " + totals.safeGetByPosition(i).column->getName(),
-                    ErrorCodes::ILLEGAL_COLUMN);
-            function = target->getAggregateFunction().get();
-            data = target->getData()[0];
+            auto & target = typeid_cast<ColumnAggregateFunction &>(*current_totals[i]);
+            function = target.getAggregateFunction().get();
+            data = target.getData()[0];
         }
 
-        const ColumnAggregateFunction::Container_t & vec = column->getData();
+        /// Accumulate all aggregate states into that value.
+
+        const ColumnAggregateFunction::Container & vec = column->getData();
         size_t size = vec.size();
 
         if (filter)

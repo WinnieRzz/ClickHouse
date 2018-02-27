@@ -1,23 +1,26 @@
 #pragma once
 
 #include <sstream>
+#include <optional>
 
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
+#include <Interpreters/Set.h>
 #include <Core/SortDescription.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
+#include <Storages/SelectQueryInfo.h>
 
 
 namespace DB
 {
 
 class IFunction;
-using FunctionPtr = std::shared_ptr<IFunction>;
+using FunctionBasePtr = std::shared_ptr<IFunctionBase>;
 
-
-/** Range with open or closed ends; Perhaps unlimited.
+/** Range with open or closed ends; possibly unbounded.
   */
 struct Range
 {
@@ -28,12 +31,12 @@ private:
 public:
     Field left;                       /// the left border, if any
     Field right;                      /// the right border, if any
-    bool left_bounded = false;        /// limited to the left
-    bool right_bounded = false;       /// limited to the right
+    bool left_bounded = false;        /// bounded at the left
+    bool right_bounded = false;       /// bounded at the right
     bool left_included = false;       /// includes the left border, if any
     bool right_included = false;      /// includes the right border, if any
 
-    /// The whole set.
+    /// The whole unversum.
     Range() {}
 
     /// One point.
@@ -145,7 +148,7 @@ public:
         /// r to the right of me.
         if (r.left_bounded
             && right_bounded
-            && (less(right, r.left)                            /// ...} {...
+            && (less(right, r.left)                          /// ...} {...
                 || ((!right_included || !r.left_included)    /// ...) [... or ...] (...
                     && equals(r.left, right))))
             return false;
@@ -186,24 +189,51 @@ public:
     String toString() const;
 };
 
+/// Class that extends arbitrary objects with infinities, like +-inf for floats
+class FieldWithInfinity
+{
+public:
+    enum Type
+    {
+        MINUS_INFINITY = -1,
+        NORMAL = 0,
+        PLUS_INFINITY = 1
+    };
 
-class ASTSet;
+    explicit FieldWithInfinity(const Field & field_);
+    FieldWithInfinity(Field && field_);
 
+    static FieldWithInfinity getMinusInfinity();
+    static FieldWithInfinity getPlusinfinity();
+
+    bool operator<(const FieldWithInfinity & other) const;
+    bool operator==(const FieldWithInfinity & other) const;
+
+private:
+    Field field;
+    Type type;
+
+    FieldWithInfinity(const Type type_);
+};
 
 /** Condition on the index.
   *
   * Consists of the conditions for the key belonging to all possible ranges or sets,
-  *  as well as logical links AND/OR/NOT above these conditions.
+  *  as well as logical operators AND/OR/NOT above these conditions.
   *
   * Constructs a reverse polish notation from these conditions
-  *  and can calculate (interpret) its feasibility over key ranges.
+  *  and can calculate (interpret) its satisfiability over key ranges.
   */
 class PKCondition
 {
 public:
-    /// Does not include the SAMPLE section. all_columns - the set of all columns of the table.
-    PKCondition(ASTPtr & query, const Context & context, const NamesAndTypesList & all_columns, const SortDescription & sort_descr,
-        const Block & pk_sample_block);
+    /// Does not take into account the SAMPLE section. all_columns - the set of all columns of the table.
+    PKCondition(
+        const SelectQueryInfo & query_info,
+        const Context & context,
+        const NamesAndTypesList & all_columns,
+        const SortDescription & sort_descr,
+        const ExpressionActionsPtr & pk_expr);
 
     /// Whether the condition is feasible in the key range.
     /// left_pk and right_pk must contain all fields in the sort_descr in the appropriate order.
@@ -262,20 +292,27 @@ public:
         size_t key_column;
         /// For FUNCTION_IN_SET, FUNCTION_NOT_IN_SET
         ASTPtr in_function;
+        using MergeTreeSetIndexPtr = std::shared_ptr<MergeTreeSetIndex>;
+        MergeTreeSetIndexPtr set_index;
 
         /** A chain of possibly monotone functions.
           * If the primary key column is wrapped in functions that can be monotonous in some value ranges
           * (for example: -toFloat64(toDayOfWeek(date))), then here the functions will be located: toDayOfWeek, toFloat64, negate.
           */
-        using MonotonicFunctionsChain = std::vector<FunctionPtr>;
+        using MonotonicFunctionsChain = std::vector<FunctionBasePtr>;
         mutable MonotonicFunctionsChain monotonic_functions_chain;    /// The function execution does not violate the constancy.
     };
 
     static Block getBlockWithConstants(
         const ASTPtr & query, const Context & context, const NamesAndTypesList & all_columns);
 
-    using AtomMap = std::unordered_map<std::string, bool(*)(RPNElement & out, const Field & value, ASTPtr & node)>;
+    using AtomMap = std::unordered_map<std::string, bool(*)(RPNElement & out, const Field & value, const ASTPtr & node)>;
     static const AtomMap atom_map;
+
+    static std::optional<Range> applyMonotonicFunctionsChainToRange(
+        Range key_range,
+        RPNElement::MonotonicFunctionsChain & functions,
+        DataTypePtr current_type);
 
 private:
     using RPN = std::vector<RPNElement>;
@@ -290,8 +327,8 @@ private:
 
     bool mayBeTrueInRangeImpl(const std::vector<Range> & key_ranges, const DataTypes & data_types) const;
 
-    void traverseAST(ASTPtr & node, const Context & context, Block & block_with_constants);
-    bool atomFromAST(ASTPtr & node, const Context & context, Block & block_with_constants, RPNElement & out);
+    void traverseAST(const ASTPtr & node, const Context & context, Block & block_with_constants);
+    bool atomFromAST(const ASTPtr & node, const Context & context, Block & block_with_constants, RPNElement & out);
     bool operatorFromAST(const ASTFunction * func, RPNElement & out);
 
     /** Is node the primary key column
@@ -313,11 +350,33 @@ private:
         DataTypePtr & out_primary_key_column_type,
         std::vector<const ASTFunction *> & out_functions_chain);
 
+    bool canConstantBeWrappedByMonotonicFunctions(
+        const ASTPtr & node,
+        size_t & out_primary_key_column_num,
+        DataTypePtr & out_primary_key_column_type,
+        Field & out_value,
+        DataTypePtr & out_type);
+
+    void getPKTuplePositionMapping(
+        const ASTPtr & node,
+        const Context & context,
+        std::vector<MergeTreeSetIndex::PKTuplePositionMapping> & indexes_mapping,
+        const size_t tuple_index,
+        size_t & out_primary_key_column_num);
+
+    bool isTupleIndexable(
+        const ASTPtr & node,
+        const Context & context,
+        RPNElement & out,
+        const SetPtr & prepared_set,
+        size_t & out_primary_key_column_num);
+
     RPN rpn;
 
     SortDescription sort_descr;
     ColumnIndices pk_columns;
-    const Block & pk_sample_block;
+    ExpressionActionsPtr pk_expr;
+    PreparedSets prepared_sets;
 };
 
 }

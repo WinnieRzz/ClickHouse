@@ -5,16 +5,16 @@
 namespace DB
 {
 
-/** Adds to one thread additional block information that is specified
+/** Adds to one stream additional block information that is specified
   * as the constructor parameter.
   */
 class BlockExtraInfoInputStream : public IProfilingBlockInputStream
 {
 public:
-    BlockExtraInfoInputStream(BlockInputStreamPtr input_, const BlockExtraInfo & block_extra_info_)
+    BlockExtraInfoInputStream(const BlockInputStreamPtr & input, const BlockExtraInfo & block_extra_info_)
         : block_extra_info(block_extra_info_)
     {
-        children.push_back(input_);
+        children.push_back(input);
     }
 
     BlockExtraInfo getBlockExtraInfo() const override
@@ -24,12 +24,7 @@ public:
 
     String getName() const override { return "BlockExtraInfoInput"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "BlockExtraInfoInput(" << children.back()->getID() << ")";
-        return res.str();
-    }
+    Block getHeader() const override { return children.back()->getHeader(); }
 
 protected:
     Block readImpl() override

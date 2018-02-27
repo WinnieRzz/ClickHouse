@@ -2,4 +2,4 @@ ClickHouse is an open-source column-oriented database management system that all
 
 [Read more...](https://clickhouse.yandex/)
 
-[Changelog](CHANGELOG.md)
+[![Build Status](https://travis-ci.org/yandex/ClickHouse.svg?branch=master)](https://travis-ci.org/yandex/ClickHouse)

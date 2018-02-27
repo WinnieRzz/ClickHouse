@@ -24,7 +24,7 @@ static void removeConstantsFromBlock(Block & block)
     size_t i = 0;
     while (i < columns)
     {
-        if (block.getByPosition(i).column->isConst())
+        if (block.getByPosition(i).column->isColumnConst())
         {
             block.erase(i);
             --columns;
@@ -34,30 +34,30 @@ static void removeConstantsFromBlock(Block & block)
     }
 }
 
-static void removeConstantsFromSortDescription(const Block & sample_block, SortDescription & description)
+static void removeConstantsFromSortDescription(const Block & header, SortDescription & description)
 {
     description.erase(std::remove_if(description.begin(), description.end(),
         [&](const SortColumnDescription & elem)
         {
             if (!elem.column_name.empty())
-                return sample_block.getByName(elem.column_name).column->isConst();
+                return header.getByName(elem.column_name).column->isColumnConst();
             else
-                return sample_block.safeGetByPosition(elem.column_number).column->isConst();
+                return header.safeGetByPosition(elem.column_number).column->isColumnConst();
         }), description.end());
 }
 
 /** Add into block, whose constant columns was removed by previous function,
-  *  constant columns from sample_block (which must have structure as before removal of constants from block).
+  *  constant columns from header (which must have structure as before removal of constants from block).
   */
-static void enrichBlockWithConstants(Block & block, const Block & sample_block)
+static void enrichBlockWithConstants(Block & block, const Block & header)
 {
     size_t rows = block.rows();
-    size_t columns = sample_block.columns();
+    size_t columns = header.columns();
 
     for (size_t i = 0; i < columns; ++i)
     {
-        const auto & col_type_name = sample_block.getByPosition(i);
-        if (col_type_name.column->isConst())
+        const auto & col_type_name = header.getByPosition(i);
+        if (col_type_name.column->isColumnConst())
             block.insert(i, {col_type_name.column->cloneResized(rows), col_type_name.type, col_type_name.name});
     }
 }
@@ -65,6 +65,12 @@ static void enrichBlockWithConstants(Block & block, const Block & sample_block)
 
 Block MergeSortingBlockInputStream::readImpl()
 {
+    if (!header)
+    {
+        header = getHeader();
+        removeConstantsFromSortDescription(header, description);
+    }
+
     /** Algorithm:
       * - read to memory blocks from source stream;
       * - if too much of them and if external sorting is enabled,
@@ -77,11 +83,10 @@ Block MergeSortingBlockInputStream::readImpl()
     {
         while (Block block = children.back()->read())
         {
-            if (!sample_block)
-            {
-                sample_block = block.cloneEmpty();
-                removeConstantsFromSortDescription(sample_block, description);
-            }
+            /// If there were only const columns in sort description, then there is no need to sort.
+            /// Return the blocks as is.
+            if (description.empty())
+                return block;
 
             removeConstantsFromBlock(block);
 
@@ -98,7 +103,7 @@ Block MergeSortingBlockInputStream::readImpl()
                 const std::string & path = temporary_files.back()->path();
                 WriteBufferFromFile file_buf(path);
                 CompressedWriteBuffer compressed_buf(file_buf);
-                NativeBlockOutputStream block_out(compressed_buf);
+                NativeBlockOutputStream block_out(compressed_buf, 0, block.cloneEmpty());
                 MergeSortingBlocksBlockInputStream block_in(blocks, description, max_merged_block_size, limit);
 
                 LOG_INFO(log, "Sorting and writing part of data into temporary file " + path);
@@ -143,14 +148,14 @@ Block MergeSortingBlockInputStream::readImpl()
 
     Block res = impl->read();
     if (res)
-        enrichBlockWithConstants(res, sample_block);
+        enrichBlockWithConstants(res, header);
     return res;
 }
 
 
 MergeSortingBlocksBlockInputStream::MergeSortingBlocksBlockInputStream(
     Blocks & blocks_, SortDescription & description_, size_t max_merged_block_size_, size_t limit_)
-    : blocks(blocks_), description(description_), max_merged_block_size(max_merged_block_size_), limit(limit_)
+    : blocks(blocks_), header(blocks.at(0).cloneEmpty()), description(description_), max_merged_block_size(max_merged_block_size_), limit(limit_)
 {
     Blocks nonempty_blocks;
     for (const auto & block : blocks)
@@ -199,12 +204,10 @@ Block MergeSortingBlocksBlockInputStream::readImpl()
 template <typename TSortCursor>
 Block MergeSortingBlocksBlockInputStream::mergeImpl(std::priority_queue<TSortCursor> & queue)
 {
-    Block merged = blocks[0].cloneEmpty();
     size_t num_columns = blocks[0].columns();
 
-    ColumnPlainPtrs merged_columns;
-    for (size_t i = 0; i < num_columns; ++i)    /// TODO: reserve
-        merged_columns.push_back(merged.safeGetByPosition(i).column.get());
+    MutableColumns merged_columns = blocks[0].cloneEmptyColumns();
+    /// TODO: reserve (in each column)
 
     /// Take rows from queue in right order and push to 'merged'.
     size_t merged_rows = 0;
@@ -225,19 +228,20 @@ Block MergeSortingBlocksBlockInputStream::mergeImpl(std::priority_queue<TSortCur
         ++total_merged_rows;
         if (limit && total_merged_rows == limit)
         {
+            auto res = blocks[0].cloneWithColumns(std::move(merged_columns));
             blocks.clear();
-            return merged;
+            return res;
         }
 
         ++merged_rows;
         if (merged_rows == max_merged_block_size)
-            return merged;
+            return blocks[0].cloneWithColumns(std::move(merged_columns));
     }
 
     if (merged_rows == 0)
-        merged.clear();
+        return {};
 
-    return merged;
+    return blocks[0].cloneWithColumns(std::move(merged_columns));
 }
 
 

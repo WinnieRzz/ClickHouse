@@ -17,8 +17,9 @@ class PrettyBlockOutputStream : public IBlockOutputStream
 {
 public:
     /// no_escapes - do not use ANSI escape sequences - to display in the browser, not in the console.
-    PrettyBlockOutputStream(WriteBuffer & ostr_, bool no_escapes_, size_t max_rows_, const Context & context_);
+    PrettyBlockOutputStream(WriteBuffer & ostr_, const Block & header_, bool no_escapes_, size_t max_rows_, const Context & context_);
 
+    Block getHeader() const override { return header; }
     void write(const Block & block) override;
     void writeSuffix() override;
 
@@ -31,12 +32,8 @@ protected:
     void writeTotals();
     void writeExtremes();
 
-    using Widths_t = std::vector<size_t>;
-
-    /// Evaluate the visible width (when outputting to the console with UTF-8 encoding) the width of the values and column names.
-    void calculateWidths(Block & block, Widths_t & max_widths, Widths_t & name_widths);
-
     WriteBuffer & ostr;
+    const Block header;
     size_t max_rows;
     size_t total_rows = 0;
     size_t terminal_width = 0;
@@ -47,6 +44,12 @@ protected:
     Block extremes;
 
     const Context & context;
+
+    using Widths = PODArray<size_t>;
+    using WidthsPerColumn = std::vector<Widths>;
+
+    static void calculateWidths(const Block & block, WidthsPerColumn & widths, Widths & max_widths, Widths & name_widths);
+    void writeValueWithPadding(const ColumnWithTypeAndName & elem, size_t row_num, size_t value_width, size_t pad_to_width);
 };
 
 }

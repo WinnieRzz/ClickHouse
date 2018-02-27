@@ -16,7 +16,7 @@
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/CompressedReadBuffer.h>
-#include <Core/StringRef.h>
+#include <common/StringRef.h>
 #include <Common/HashTable/HashMap.h>
 #include <Interpreters/AggregationCommon.h>
 
@@ -49,7 +49,7 @@ struct SmallStringRef
     }
 
     SmallStringRef(const unsigned char * data_, size_t size_) : SmallStringRef(reinterpret_cast<const char *>(data_), size_) {}
-    SmallStringRef(const std::string & s) : SmallStringRef(s.data(), s.size()) {}
+    explicit SmallStringRef(const std::string & s) : SmallStringRef(s.data(), s.size()) {}
     SmallStringRef() {}
 
     std::string toString() const { return std::string(data(), size); }
@@ -96,6 +96,12 @@ using Value = UInt64;
 
 int main(int argc, char ** argv)
 {
+    if (argc < 3)
+    {
+        std::cerr << "Usage: program n m\n";
+        return 1;
+    }
+
     size_t n = atoi(argv[1]);
     size_t m = atoi(argv[2]);
 

@@ -5,7 +5,7 @@
 #include <DataStreams/IProfilingBlockInputStream.h>
 #include <Common/setThreadName.h>
 #include <Common/CurrentMetrics.h>
-#include <Common/ThreadPool.h>
+#include <common/ThreadPool.h>
 #include <Common/MemoryTracker.h>
 
 
@@ -28,19 +28,12 @@ namespace DB
 class AsynchronousBlockInputStream : public IProfilingBlockInputStream
 {
 public:
-    AsynchronousBlockInputStream(BlockInputStreamPtr in_)
+    AsynchronousBlockInputStream(const BlockInputStreamPtr & in)
     {
-        children.push_back(in_);
+        children.push_back(in);
     }
 
     String getName() const override { return "Asynchronous"; }
-
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Asynchronous(" << children.back()->getID() << ")";
-        return res.str();
-    }
 
     void readPrefix() override
     {
@@ -80,6 +73,9 @@ public:
     }
 
 
+    Block getHeader() const override { return children.at(0)->getHeader(); }
+
+
     ~AsynchronousBlockInputStream() override
     {
         if (started)
@@ -115,7 +111,7 @@ protected:
             return res;
 
         /// Start the next block calculation
-        block = Block();
+        block.clear();
         next();
 
         return res;

@@ -6,20 +6,17 @@
 namespace DB
 {
 
-/** Пара из имени и типа. Например, browser FixedString(2).
+/** A pair of the name and type. For example, browser FixedString(2).
   */
 class ASTNameTypePair : public IAST
 {
 public:
-    /// имя
+    /// name
     String name;
-    /// тип
+    /// type
     ASTPtr type;
 
-    ASTNameTypePair() = default;
-    ASTNameTypePair(const StringRange range_) : IAST(range_) {}
-
-    /** Получить текст, который идентифицирует этот элемент. */
+    /** Get the text that identifies this element. */
     String getID() const override { return "NameTypePair_" + name; }
 
     ASTPtr clone() const override
@@ -27,7 +24,11 @@ public:
         auto res = std::make_shared<ASTNameTypePair>(*this);
         res->children.clear();
 
-        if (type)     { res->type = type->clone();     res->children.push_back(res->type); }
+        if (type)
+        {
+            res->type = type;
+            res->children.push_back(res->type);
+        }
 
         return res;
     }

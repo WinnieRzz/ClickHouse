@@ -1,7 +1,11 @@
 #pragma once
 
-#include <common/singleton.h>
+#include <Poco/Util/AbstractConfiguration.h>
+#include <Poco/Exception.h>
+
 #include <common/Types.h>
+
+#include <ext/singleton.h>
 
 
 /** @brief Class that lets you know if a search engine or operating system belongs
@@ -18,7 +22,7 @@ public:
     void reload();
 
     /// Has corresponding section in configuration file.
-    static bool isConfigured();
+    static bool isConfigured(const Poco::Util::AbstractConfiguration & config);
 
 
     /// The "belongs" relation.
@@ -67,4 +71,4 @@ public:
 };
 
 
-class TechDataHierarchySingleton : public Singleton<TechDataHierarchySingleton>, public TechDataHierarchy {};
+class TechDataHierarchySingleton : public ext::singleton<TechDataHierarchySingleton>, public TechDataHierarchy {};

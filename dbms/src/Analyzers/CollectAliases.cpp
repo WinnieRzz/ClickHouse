@@ -4,6 +4,7 @@
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -26,9 +27,9 @@ static void processImpl(const ASTPtr & ast, CollectAliases::Aliases & aliases, C
         {
             std::stringstream message;
             message << "Different expressions with the same alias " << backQuoteIfNeed(alias) << ":\n";
-            formatAST(*it_inserted.first->second.node, message, 0, false, true);
+            formatAST(*it_inserted.first->second.node, message, false, true);
             message << "\nand\n";
-            formatAST(*ast, message, 0, false, true);
+            formatAST(*ast, message, false, true);
             message << "\n";
 
             throw Exception(message.str(), ErrorCodes::MULTIPLE_EXPRESSIONS_FOR_ALIAS);
@@ -97,7 +98,7 @@ void CollectAliases::dump(WriteBuffer & out) const
         }
 
         std::stringstream formatted_ast;
-        formatAST(*it->second.node, formatted_ast, 0, false, true);
+        formatAST(*it->second.node, formatted_ast, false, true);
         writeString(formatted_ast.str(), out);
 
         writeChar('\n', out);

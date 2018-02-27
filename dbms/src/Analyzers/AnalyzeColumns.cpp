@@ -11,6 +11,7 @@
 #include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
 #include <Poco/String.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -134,7 +135,7 @@ ASTPtr createASTIdentifierForColumnInTable(const String & column, const CollectT
 {
     ASTPtr database_name_identifier_node;
     if (!table.database_name.empty())
-        database_name_identifier_node =  std::make_shared<ASTIdentifier>(StringRange(), table.database_name, ASTIdentifier::Column);
+        database_name_identifier_node =  std::make_shared<ASTIdentifier>(table.database_name, ASTIdentifier::Column);
 
     ASTPtr table_name_identifier_node;
     String table_name_or_alias;
@@ -145,9 +146,9 @@ ASTPtr createASTIdentifierForColumnInTable(const String & column, const CollectT
         table_name_or_alias = table.alias;
 
     if (!table_name_or_alias.empty())
-        table_name_identifier_node = std::make_shared<ASTIdentifier>(StringRange(), table_name_or_alias, ASTIdentifier::Column);
+        table_name_identifier_node = std::make_shared<ASTIdentifier>(table_name_or_alias, ASTIdentifier::Column);
 
-    ASTPtr column_identifier_node = std::make_shared<ASTIdentifier>(StringRange(), column, ASTIdentifier::Column);
+    ASTPtr column_identifier_node = std::make_shared<ASTIdentifier>(column, ASTIdentifier::Column);
 
     String compound_name;
     if (database_name_identifier_node)
@@ -156,8 +157,7 @@ ASTPtr createASTIdentifierForColumnInTable(const String & column, const CollectT
         compound_name += table_name_or_alias + ".";
     compound_name += column;
 
-    auto elem = std::make_shared<ASTIdentifier>(
-        StringRange(), compound_name, ASTIdentifier::Column);
+    auto elem = std::make_shared<ASTIdentifier>(compound_name, ASTIdentifier::Column);
 
     if (database_name_identifier_node)
         elem->children.emplace_back(std::move(database_name_identifier_node));
@@ -181,8 +181,7 @@ void createASTsForAllColumnsInTable(const CollectTables::TableInfo & table, ASTs
 }
 
 
-ASTs expandUnqualifiedAsterisk(
-    AnalyzeColumns::Columns & columns, const CollectAliases & aliases, const CollectTables & tables)
+ASTs expandUnqualifiedAsterisk(const CollectTables & tables)
 {
     ASTs res;
     for (const auto & table : tables.tables)
@@ -192,7 +191,7 @@ ASTs expandUnqualifiedAsterisk(
 
 
 ASTs expandQualifiedAsterisk(
-    const IAST & ast, AnalyzeColumns::Columns & columns, const CollectAliases & aliases, const CollectTables & tables)
+    const IAST & ast, const CollectTables & tables)
 {
     if (ast.children.size() != 1)
         throw Exception("Logical error: AST node for qualified asterisk has number of children not equal to one", ErrorCodes::LOGICAL_ERROR);
@@ -352,13 +351,13 @@ void processImpl(ASTPtr & ast, AnalyzeColumns::Columns & columns, const CollectA
         {
             if (typeid_cast<ASTAsterisk *>(asts[i].get()))
             {
-                ASTs expanded = expandUnqualifiedAsterisk(columns, aliases, tables);
+                ASTs expanded = expandUnqualifiedAsterisk(tables);
                 asts.erase(asts.begin() + i);
                 asts.insert(asts.begin() + i, expanded.begin(), expanded.end());
             }
             else if (ASTQualifiedAsterisk * asterisk = typeid_cast<ASTQualifiedAsterisk *>(asts[i].get()))
             {
-                ASTs expanded = expandQualifiedAsterisk(*asterisk, columns, aliases, tables);
+                ASTs expanded = expandQualifiedAsterisk(*asterisk, tables);
                 asts.erase(asts.begin() + i);
                 asts.insert(asts.begin() + i, expanded.begin(), expanded.end());
             }
@@ -379,8 +378,17 @@ void processImpl(ASTPtr & ast, AnalyzeColumns::Columns & columns, const CollectA
 
 void AnalyzeColumns::process(ASTPtr & ast, const CollectAliases & aliases, const CollectTables & tables)
 {
+    /// If this is SELECT query, don't go into FORMAT and SETTINGS clauses
+    /// - they contain identifiers that are not columns.
+    const ASTSelectQuery * select = typeid_cast<const ASTSelectQuery *>(ast.get());
+
     for (auto & child : ast->children)
+    {
+        if (select && (child.get() == select->format.get() || child.get() == select->settings.get()))
+            continue;
+
         processImpl(child, columns, aliases, tables);
+    }
 }
 
 
@@ -433,7 +441,7 @@ void AnalyzeColumns::dump(WriteBuffer & out) const
         if (it->second.node)
         {
             std::stringstream formatted_ast;
-            formatAST(*it->second.node, formatted_ast, 0, false, true);
+            formatAST(*it->second.node, formatted_ast, false, true);
             writeString(formatted_ast.str(), out);
         }
         else

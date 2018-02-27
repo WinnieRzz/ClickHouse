@@ -1,7 +1,6 @@
 #include <Storages/MergeTree/MergeTreeReader.h>
 #include <Storages/MergeTree/MergeTreeReadPool.h>
 #include <Storages/MergeTree/MergeTreeThreadBlockInputStream.h>
-#include <Columns/ColumnNullable.h>
 
 
 namespace DB
@@ -14,6 +13,7 @@ MergeTreeThreadBlockInputStream::MergeTreeThreadBlockInputStream(
     const size_t min_marks_to_read_,
     const size_t max_block_size_rows,
     size_t preferred_block_size_bytes,
+    size_t preferred_max_column_in_block_size_bytes,
     MergeTreeData & storage,
     const bool use_uncompressed_cache,
     const ExpressionActionsPtr & prewhere_actions,
@@ -21,8 +21,9 @@ MergeTreeThreadBlockInputStream::MergeTreeThreadBlockInputStream(
     const Settings & settings,
     const Names & virt_column_names)
     :
-    MergeTreeBaseBlockInputStream{storage, prewhere_actions, prewhere_column, max_block_size_rows, preferred_block_size_bytes,
-        settings.min_bytes_to_use_direct_io, settings.max_read_buffer_size, use_uncompressed_cache, true, virt_column_names},
+    MergeTreeBaseBlockInputStream{storage, prewhere_actions, prewhere_column, max_block_size_rows,
+        preferred_block_size_bytes, preferred_max_column_in_block_size_bytes, settings.min_bytes_to_use_direct_io,
+        settings.max_read_buffer_size, use_uncompressed_cache, true, virt_column_names},
     thread{thread},
     pool{pool}
 {
@@ -34,18 +35,15 @@ MergeTreeThreadBlockInputStream::MergeTreeThreadBlockInputStream(
     }
     else
         min_marks_to_read = min_marks_to_read_;
-
-    log = &Logger::get("MergeTreeThreadBlockInputStream");
 }
 
 
-String MergeTreeThreadBlockInputStream::getID() const
+Block MergeTreeThreadBlockInputStream::getHeader() const
 {
-    std::stringstream res;
-    /// @todo print some meaningful information
-    res << static_cast<const void *>(this);
-    return res.str();
-}
+    auto res = pool->getHeader();
+    injectVirtualColumns(res);
+    return res;
+};
 
 
 /// Requests read task from MergeTreeReadPool and signals whether it got one

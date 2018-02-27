@@ -1,4 +1,5 @@
 #include <IO/WriteHelpers.h>
+#include <IO/WriteBufferFromString.h>
 #include <DataStreams/TSKVRowOutputStream.h>
 
 
@@ -8,18 +9,15 @@ namespace DB
 TSKVRowOutputStream::TSKVRowOutputStream(WriteBuffer & ostr_, const Block & sample_)
     : TabSeparatedRowOutputStream(ostr_, sample_)
 {
-    NamesAndTypesList columns(sample_.getColumnsList());
+    NamesAndTypesList columns(sample_.getNamesAndTypesList());
     fields.assign(columns.begin(), columns.end());
 
     for (auto & field : fields)
     {
-        String prepared_field_name;
-        {
-            WriteBufferFromString wb(prepared_field_name);
-            writeAnyEscapedString<'='>(field.name.data(), field.name.data() + field.name.size(), wb);
-            writeCString("=", wb);
-        }
-        field.name = prepared_field_name;
+        WriteBufferFromOwnString wb;
+        writeAnyEscapedString<'='>(field.name.data(), field.name.data() + field.name.size(), wb);
+        writeCString("=", wb);
+        field.name = wb.str();
     }
 }
 

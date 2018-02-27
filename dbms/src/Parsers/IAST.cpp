@@ -16,15 +16,15 @@ namespace ErrorCodes
 }
 
 
-const char * IAST::hilite_keyword         = "\033[1m";
-const char * IAST::hilite_identifier     = "\033[0;36m";
-const char * IAST::hilite_function         = "\033[0;33m";
-const char * IAST::hilite_operator         = "\033[1;33m";
-const char * IAST::hilite_alias         = "\033[0;32m";
-const char * IAST::hilite_none             = "\033[0m";
+const char * IAST::hilite_keyword    = "\033[1m";
+const char * IAST::hilite_identifier = "\033[0;36m";
+const char * IAST::hilite_function   = "\033[0;33m";
+const char * IAST::hilite_operator   = "\033[1;33m";
+const char * IAST::hilite_alias      = "\033[0;32m";
+const char * IAST::hilite_none       = "\033[0m";
 
 
-/// Quota the identifier with backquotes, if required.
+/// Quote the identifier with backquotes, if required.
 String backQuoteIfNeed(const String & x)
 {
     String res(x.size(), '\0');
@@ -58,35 +58,6 @@ size_t IAST::checkSize(size_t max_size) const
         throw Exception("AST is too big. Maximum: " + toString(max_size), ErrorCodes::TOO_BIG_AST);
 
     return res;
-}
-
-
-String IAST::getTreeID() const
-{
-    String res;
-    {
-        WriteBufferFromString out(res);
-        getTreeIDImpl(out);
-    }
-    return res;
-}
-
-
-void IAST::getTreeIDImpl(WriteBuffer & out) const
-{
-    out << getID();
-
-    if (!children.empty())
-    {
-        out << '(';
-        for (ASTs::const_iterator it = children.begin(); it != children.end(); ++it)
-        {
-            if (it != children.begin())
-                out << ", ";
-            (*it)->getTreeIDImpl(out);
-        }
-        out << ')';
-    }
 }
 
 

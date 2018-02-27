@@ -7,8 +7,10 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
+#include <Common/typeid_cast.h>
 
 #include <TableFunctions/TableFunctionRemote.h>
+#include <TableFunctions/TableFunctionFactory.h>
 
 
 namespace DB
@@ -34,7 +36,7 @@ static void append(std::vector<String> & to, const std::vector<String> & what, s
     }
 
     if (what.size() * to.size() > max_addresses)
-        throw Exception("Storage Distributed, first argument generates too many result addresses",
+        throw Exception("Table function 'remote': first argument generates too many result addresses",
                         ErrorCodes::BAD_ARGUMENTS);
     std::vector<String> res;
     for (size_t i = 0; i < to.size(); ++i)
@@ -51,7 +53,7 @@ static bool parseNumber(const String & description, size_t l, size_t r, size_t &
     res = 0;
     for (size_t pos = l; pos < r; pos ++)
     {
-        if (!isdigit(description[pos]))
+        if (!isNumericASCII(description[pos]))
             return false;
         res = res * 10 + description[pos] - '0';
         if (res > 1e15)
@@ -107,29 +109,29 @@ static std::vector<String> parseDescription(const String & description, size_t l
                 if (cnt == 0) break;
             }
             if (cnt != 0)
-                throw Exception("Storage Distributed, incorrect brace sequence in first argument",
+                throw Exception("Table function 'remote': incorrect brace sequence in first argument",
                                 ErrorCodes::BAD_ARGUMENTS);
             /// The presence of a dot - numeric interval
             if (last_dot != -1)
             {
                 size_t left, right;
                 if (description[last_dot - 1] != '.')
-                    throw Exception("Storage Distributed, incorrect argument in braces (only one dot): " + description.substr(i, m - i + 1),
+                    throw Exception("Table function 'remote': incorrect argument in braces (only one dot): " + description.substr(i, m - i + 1),
                                     ErrorCodes::BAD_ARGUMENTS);
                 if (!parseNumber(description, i + 1, last_dot - 1, left))
-                    throw Exception("Storage Distributed, incorrect argument in braces (Incorrect left number): "
+                    throw Exception("Table function 'remote': incorrect argument in braces (Incorrect left number): "
                                     + description.substr(i, m - i + 1),
                                     ErrorCodes::BAD_ARGUMENTS);
                 if (!parseNumber(description, last_dot + 1, m, right))
-                    throw Exception("Storage Distributed, incorrect argument in braces (Incorrect right number): "
+                    throw Exception("Table function 'remote': incorrect argument in braces (Incorrect right number): "
                                     + description.substr(i, m - i + 1),
                                     ErrorCodes::BAD_ARGUMENTS);
                 if (left > right)
-                    throw Exception("Storage Distributed, incorrect argument in braces (left number is greater then right): "
+                    throw Exception("Table function 'remote': incorrect argument in braces (left number is greater then right): "
                                     + description.substr(i, m - i + 1),
                                     ErrorCodes::BAD_ARGUMENTS);
                 if (right - left + 1 >  max_addresses)
-                    throw Exception("Storage Distributed, first argument generates too many result addresses",
+                    throw Exception("Table function 'remote': first argument generates too many result addresses",
                         ErrorCodes::BAD_ARGUMENTS);
                 bool add_leading_zeroes = false;
                 size_t len = last_dot - 1 - (i + 1);
@@ -138,7 +140,7 @@ static std::vector<String> parseDescription(const String & description, size_t l
                     add_leading_zeroes = true;
                 for (size_t id = left; id <= right; ++id)
                 {
-                    String cur = toString<uint64>(id);
+                    String cur = toString<UInt64>(id);
                     if (add_leading_zeroes)
                     {
                         while (cur.size() < len)
@@ -146,7 +148,8 @@ static std::vector<String> parseDescription(const String & description, size_t l
                     }
                     buffer.push_back(cur);
                 }
-            } else if (have_splitter) /// If there is a current delimiter inside, then generate a set of resulting rows
+            }
+            else if (have_splitter) /// If there is a current delimiter inside, then generate a set of resulting rows
                 buffer = parseDescription(description, i + 1, m, separator, max_addresses);
             else                     /// Otherwise just copy, spawn will occur when you call with the correct delimiter
                 buffer.push_back(description.substr(i, m - i + 1));
@@ -168,30 +171,31 @@ static std::vector<String> parseDescription(const String & description, size_t l
             append(cur, buffer, max_addresses);
         }
     }
+
     res.insert(res.end(), cur.begin(), cur.end());
     if (res.size() > max_addresses)
-        throw Exception("Storage Distributed, first argument generates too many result addresses",
-                        ErrorCodes::BAD_ARGUMENTS);
+        throw Exception("Table function 'remote': first argument generates too many result addresses",
+            ErrorCodes::BAD_ARGUMENTS);
+
     return res;
 }
 
 
-StoragePtr TableFunctionRemote::execute(ASTPtr ast_function, Context & context) const
+StoragePtr TableFunctionRemote::execute(const ASTPtr & ast_function, const Context & context) const
 {
     ASTs & args_func = typeid_cast<ASTFunction &>(*ast_function).children;
 
-    const char * err = "Table function 'remote' requires from 2 to 5 parameters: "
-        "addresses pattern, name of remote database, name of remote table, [username, [password]].";
-
     if (args_func.size() != 1)
-        throw Exception(err, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+        throw Exception(help_message, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
     ASTs & args = typeid_cast<ASTExpressionList &>(*args_func.at(0)).children;
 
-    if (args.size() < 2 || args.size() > 5)
-        throw Exception(err, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+    const size_t max_args = is_cluster_function ? 3 : 5;
+    if (args.size() < 2 || args.size() > max_args)
+        throw Exception(help_message, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-    String description;
+    String cluster_name;
+    String cluster_description;
     String remote_database;
     String remote_table;
     String username;
@@ -211,10 +215,21 @@ StoragePtr TableFunctionRemote::execute(ASTPtr ast_function, Context & context) 
         return safeGet<const String &>(lit->value);
     };
 
-    description = getStringLiteral(*args[arg_num], "Hosts pattern");
+    if (is_cluster_function)
+    {
+        ASTPtr ast_name = evaluateConstantExpressionOrIdentifierAsLiteral(args[arg_num], context);
+        cluster_name = static_cast<const ASTLiteral &>(*ast_name).value.safeGet<const String &>();
+    }
+    else
+    {
+        if (auto ast_cluster = typeid_cast<const ASTIdentifier *>(args[arg_num].get()))
+            cluster_name = ast_cluster->name;
+        else
+            cluster_description = getStringLiteral(*args[arg_num], "Hosts pattern");
+    }
     ++arg_num;
 
-    args[arg_num] = evaluateConstantExpressionOrIdentidierAsLiteral(args[arg_num], context);
+    args[arg_num] = evaluateConstantExpressionOrIdentifierAsLiteral(args[arg_num], context);
     remote_database = static_cast<const ASTLiteral &>(*args[arg_num]).value.safeGet<String>();
     ++arg_num;
 
@@ -228,29 +243,33 @@ StoragePtr TableFunctionRemote::execute(ASTPtr ast_function, Context & context) 
     else
     {
         if (arg_num >= args.size())
-            throw Exception(err, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(help_message, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-        args[arg_num] = evaluateConstantExpressionOrIdentidierAsLiteral(args[arg_num], context);
+        args[arg_num] = evaluateConstantExpressionOrIdentifierAsLiteral(args[arg_num], context);
         remote_table = static_cast<const ASTLiteral &>(*args[arg_num]).value.safeGet<String>();
         ++arg_num;
     }
 
-    if (arg_num < args.size())
+    /// Username and password parameters are prohibited in cluster version of the function
+    if (!is_cluster_function)
     {
-        username = getStringLiteral(*args[arg_num], "Username");
-        ++arg_num;
+        if (arg_num < args.size())
+        {
+            username = getStringLiteral(*args[arg_num], "Username");
+            ++arg_num;
+        }
+        else
+            username = "default";
+
+        if (arg_num < args.size())
+        {
+            password = getStringLiteral(*args[arg_num], "Password");
+            ++arg_num;
+        }
     }
-    else
-        username = "default";
 
     if (arg_num < args.size())
-    {
-        password = getStringLiteral(*args[arg_num], "Password");
-        ++arg_num;
-    }
-
-    if (arg_num < args.size())
-        throw Exception(err, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+        throw Exception(help_message, ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
     /// ExpressionAnalyzer will be created in InterpreterSelectQuery that will meet these `Identifier` when processing the request.
     /// We need to mark them as the name of the database or table, because the default value is column.
@@ -258,26 +277,57 @@ StoragePtr TableFunctionRemote::execute(ASTPtr ast_function, Context & context) 
         if (ASTIdentifier * id = typeid_cast<ASTIdentifier *>(arg.get()))
             id->kind = ASTIdentifier::Table;
 
-    size_t max_addresses = context.getSettingsRef().table_function_remote_max_addresses;
+    ClusterPtr cluster;
+    if (!cluster_name.empty())
+    {
+        /// Use an existing cluster from the main config
+        cluster = context.getCluster(cluster_name);
+    }
+    else
+    {
+        /// Create new cluster from the scratch
+        size_t max_addresses = context.getSettingsRef().table_function_remote_max_addresses;
+        std::vector<String> shards = parseDescription(cluster_description, 0, cluster_description.size(), ',', max_addresses);
 
-    std::vector<std::vector<String>> names;
-    std::vector<String> shards = parseDescription(description, 0, description.size(), ',', max_addresses);
+        std::vector<std::vector<String>> names;
+        for (size_t i = 0; i < shards.size(); ++i)
+            names.push_back(parseDescription(shards[i], 0, shards[i].size(), '|', max_addresses));
 
-    for (size_t i = 0; i < shards.size(); ++i)
-        names.push_back(parseDescription(shards[i], 0, shards[i].size(), '|', max_addresses));
+        if (names.empty())
+            throw Exception("Shard list is empty after parsing first argument", ErrorCodes::BAD_ARGUMENTS);
 
-    if (names.empty())
-        throw Exception("Shard list is empty after parsing first argument", ErrorCodes::BAD_ARGUMENTS);
+        cluster = std::make_shared<Cluster>(context.getSettings(), names, username, password, context.getTCPPort());
+    }
 
-    auto cluster = std::make_shared<Cluster>(context.getSettings(), names, username, password);
-
-    return StorageDistributed::create(
+    auto res = StorageDistributed::createWithOwnCluster(
         getName(),
-        std::make_shared<NamesAndTypesList>(getStructureOfRemoteTable(*cluster, remote_database, remote_table, context)),
+        getStructureOfRemoteTable(*cluster, remote_database, remote_table, context),
         remote_database,
         remote_table,
         cluster,
         context);
+    res->startup();
+    return res;
+}
+
+
+TableFunctionRemote::TableFunctionRemote(const std::string & name_)
+    : name(name_)
+{
+    is_cluster_function = name == "cluster";
+
+    std::stringstream ss;
+    ss << "Table function '" << name + "' requires from 2 to " << (is_cluster_function ? 3 : 5) << " parameters"
+       << ": <addresses pattern or cluster name>, <name of remote database>, <name of remote table>"
+       << (is_cluster_function ? "" : ", [username, [password]].");
+    help_message = ss.str();
+}
+
+
+void registerTableFunctionRemote(TableFunctionFactory & factory)
+{
+    factory.registerFunction("remote", [] () -> TableFunctionPtr { return std::make_shared<TableFunctionRemote>("remote"); });
+    factory.registerFunction("cluster", [] () -> TableFunctionPtr { return std::make_shared<TableFunctionRemote>("cluster"); });
 }
 
 }

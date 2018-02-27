@@ -5,8 +5,8 @@
 namespace DB
 {
 
-BlockOutputStreamFromRowOutputStream::BlockOutputStreamFromRowOutputStream(RowOutputStreamPtr row_output_)
-    : row_output(row_output_), first_row(true) {}
+BlockOutputStreamFromRowOutputStream::BlockOutputStreamFromRowOutputStream(RowOutputStreamPtr row_output_, const Block & header_)
+    : row_output(row_output_), header(header_) {}
 
 
 void BlockOutputStreamFromRowOutputStream::write(const Block & block)
@@ -28,7 +28,7 @@ void BlockOutputStreamFromRowOutputStream::write(const Block & block)
                 row_output->writeFieldDelimiter();
 
             auto & col = block.getByPosition(j);
-            row_output->writeField(*col.column.get(), *col.type.get(), i);
+            row_output->writeField(*col.column, *col.type, i);
         }
 
         row_output->writeRowEndDelimiter();

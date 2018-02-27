@@ -1,28 +1,32 @@
 #pragma once
 
-#include <Interpreters/Context.h>
 #include <Interpreters/IInterpreter.h>
 
 
 namespace DB
 {
 
+class Context;
+class IAST;
+using ASTPtr = std::shared_ptr<IAST>;
 
-/** Вернуть названия и типы столбцов указанной таблицы.
-    */
+
+/** Return names, types and other information about columns in specified table.
+  */
 class InterpreterDescribeQuery : public IInterpreter
 {
 public:
-    InterpreterDescribeQuery(ASTPtr query_ptr_, const Context & context_)
+    InterpreterDescribeQuery(const ASTPtr & query_ptr_, const Context & context_)
         : query_ptr(query_ptr_), context(context_) {}
 
     BlockIO execute() override;
 
+    static Block getSampleBlock();
+
 private:
     ASTPtr query_ptr;
-    Context context;
+    const Context & context;
 
-    Block getSampleBlock();
     BlockInputStreamPtr executeImpl();
 };
 

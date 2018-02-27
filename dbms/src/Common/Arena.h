@@ -59,7 +59,8 @@ private:
                 delete prev;
         }
 
-        size_t size() { return end - begin; }
+        size_t size() const { return end - begin; }
+        size_t remaining() const { return end - pos; }
     };
 
     size_t growth_factor;
@@ -97,6 +98,8 @@ private:
         head = new Chunk(nextSize(min_size), head);
         size_in_bytes += head->size();
     }
+
+    friend class ArenaAllocator;
 
 public:
     Arena(size_t initial_size_ = 4096, size_t growth_factor_ = 2, size_t linear_growth_threshold_ = 128 * 1024 * 1024)
@@ -177,6 +180,11 @@ public:
     size_t size() const
     {
         return size_in_bytes;
+    }
+
+    size_t remainingSpaceInCurrentChunk() const
+    {
+        return head->remaining();
     }
 };
 

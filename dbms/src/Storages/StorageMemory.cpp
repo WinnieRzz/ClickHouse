@@ -5,30 +5,27 @@
 #include <DataStreams/IProfilingBlockInputStream.h>
 
 #include <Storages/StorageMemory.h>
+#include <Storages/StorageFactory.h>
 
 
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+}
+
+
 class MemoryBlockInputStream : public IProfilingBlockInputStream
 {
 public:
-    MemoryBlockInputStream(const Names & column_names_, BlocksList::iterator begin_, BlocksList::iterator end_)
-        : column_names(column_names_), begin(begin_), end(end_), it(begin) {}
+    MemoryBlockInputStream(const Names & column_names_, BlocksList::iterator begin_, BlocksList::iterator end_, const StorageMemory & storage_)
+        : column_names(column_names_), begin(begin_), end(end_), it(begin), storage(storage_) {}
 
     String getName() const override { return "Memory"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Memory(" << &*begin << ", " << &*end;
-
-        for (const auto & name : column_names)
-            res << ", " << name;
-
-        res << ")";
-        return res.str();
-    }
+    Block getHeader() const override { return storage.getSampleBlockForColumns(column_names); }
 
 protected:
     Block readImpl() override
@@ -55,13 +52,16 @@ private:
     BlocksList::iterator begin;
     BlocksList::iterator end;
     BlocksList::iterator it;
+    const StorageMemory & storage;
 };
 
 
 class MemoryBlockOutputStream : public IBlockOutputStream
 {
 public:
-    MemoryBlockOutputStream(StorageMemory & storage_) : storage(storage_) {}
+    explicit MemoryBlockOutputStream(StorageMemory & storage_) : storage(storage_) {}
+
+    Block getHeader() const override { return storage.getSampleBlock(); }
 
     void write(const Block & block) override
     {
@@ -76,50 +76,23 @@ private:
 
 StorageMemory::StorageMemory(
     const std::string & name_,
-    NamesAndTypesListPtr columns_)
-    : name(name_), columns(columns_)
-{
-}
-
-
-StorageMemory::StorageMemory(
-    const std::string & name_,
-    NamesAndTypesListPtr columns_,
+    const NamesAndTypesList & columns_,
     const NamesAndTypesList & materialized_columns_,
     const NamesAndTypesList & alias_columns_,
     const ColumnDefaults & column_defaults_)
-    : IStorage{materialized_columns_, alias_columns_, column_defaults_},
-    name(name_), columns(columns_)
+    : IStorage{columns_, materialized_columns_, alias_columns_, column_defaults_},
+    name(name_)
 {
-}
-
-
-StoragePtr StorageMemory::create(
-    const std::string & name_,
-    NamesAndTypesListPtr columns_)
-{
-    return make_shared(name_, columns_);
-}
-
-StoragePtr StorageMemory::create(
-    const std::string & name_,
-    NamesAndTypesListPtr columns_,
-    const NamesAndTypesList & materialized_columns_,
-    const NamesAndTypesList & alias_columns_,
-    const ColumnDefaults & column_defaults_)
-{
-    return make_shared(name_, columns_, materialized_columns_, alias_columns_, column_defaults_);
 }
 
 
 BlockInputStreams StorageMemory::read(
     const Names & column_names,
-    ASTPtr query,
-    const Context & context,
-    const Settings & settings,
+    const SelectQueryInfo & /*query_info*/,
+    const Context & /*context*/,
     QueryProcessingStage::Enum & processed_stage,
-    size_t max_block_size,
-    unsigned threads)
+    size_t /*max_block_size*/,
+    unsigned num_streams)
 {
     check(column_names);
     processed_stage = QueryProcessingStage::FetchColumns;
@@ -128,20 +101,20 @@ BlockInputStreams StorageMemory::read(
 
     size_t size = data.size();
 
-    if (threads > size)
-        threads = size;
+    if (num_streams > size)
+        num_streams = size;
 
     BlockInputStreams res;
 
-    for (size_t thread = 0; thread < threads; ++thread)
+    for (size_t stream = 0; stream < num_streams; ++stream)
     {
         BlocksList::iterator begin = data.begin();
         BlocksList::iterator end = data.begin();
 
-        std::advance(begin, thread * size / threads);
-        std::advance(end, (thread + 1) * size / threads);
+        std::advance(begin, stream * size / num_streams);
+        std::advance(end, (stream + 1) * size / num_streams);
 
-        res.push_back(std::make_shared<MemoryBlockInputStream>(column_names, begin, end));
+        res.push_back(std::make_shared<MemoryBlockInputStream>(column_names, begin, end, *this));
     }
 
     return res;
@@ -149,7 +122,7 @@ BlockInputStreams StorageMemory::read(
 
 
 BlockOutputStreamPtr StorageMemory::write(
-    ASTPtr query, const Settings & settings)
+    const ASTPtr & /*query*/, const Settings & /*settings*/)
 {
     return std::make_shared<MemoryBlockOutputStream>(*this);
 }
@@ -159,6 +132,20 @@ void StorageMemory::drop()
 {
     std::lock_guard<std::mutex> lock(mutex);
     data.clear();
+}
+
+
+void registerStorageMemory(StorageFactory & factory)
+{
+    factory.registerStorage("Memory", [](const StorageFactory::Arguments & args)
+    {
+        if (!args.engine_args.empty())
+            throw Exception(
+                "Engine " + args.engine_name + " doesn't support any arguments (" + toString(args.engine_args.size()) + " given)",
+                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+
+        return StorageMemory::create(args.table_name, args.columns, args.materialized_columns, args.alias_columns, args.column_defaults);
+    });
 }
 
 }

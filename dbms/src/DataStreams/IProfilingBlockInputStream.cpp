@@ -1,10 +1,10 @@
 #include <iomanip>
 #include <random>
 
-#include <Columns/ColumnConst.h>
 #include <Interpreters/Quota.h>
 #include <Interpreters/ProcessList.h>
 #include <DataStreams/IProfilingBlockInputStream.h>
+
 
 namespace DB
 {
@@ -15,24 +15,27 @@ namespace ErrorCodes
     extern const int TOO_MUCH_BYTES;
     extern const int TIMEOUT_EXCEEDED;
     extern const int TOO_SLOW;
+    extern const int LOGICAL_ERROR;
+    extern const int BLOCKS_HAVE_DIFFERENT_STRUCTURE;
 }
 
 
+IProfilingBlockInputStream::IProfilingBlockInputStream()
+{
+    info.parent = this;
+}
+
 Block IProfilingBlockInputStream::read()
 {
-    collectAndSendTotalRowsApprox();
+    if (total_rows_approx)
+    {
+        progressImpl(Progress(0, 0, total_rows_approx));
+        total_rows_approx = 0;
+    }
 
     if (!info.started)
     {
         info.total_stopwatch.start();
-        info.stream_name = getName();
-
-        for (const auto & child : children)
-            if (const IProfilingBlockInputStream * p_child = dynamic_cast<const IProfilingBlockInputStream *>(&*child))
-                info.nested_infos.push_back(&p_child->info);
-
-        /// Note that after this, `children` elements can not be deleted before you might need to work with `nested_info`.
-
         info.started = true;
     }
 
@@ -40,6 +43,9 @@ Block IProfilingBlockInputStream::read()
 
     if (is_cancelled.load(std::memory_order_seq_cst))
         return res;
+
+    if (!checkTimeLimits())
+        limit_exceeded_need_break = true;
 
     if (!limit_exceeded_need_break)
         res = readImpl();
@@ -51,7 +57,7 @@ Block IProfilingBlockInputStream::read()
         if (enabled_extremes)
             updateExtremes(res);
 
-        if (!checkLimits())
+        if (!checkDataSizeLimits())
             limit_exceeded_need_break = true;
 
         if (quota != nullptr)
@@ -62,13 +68,22 @@ Block IProfilingBlockInputStream::read()
         /** If the thread is over, then we will ask all children to abort the execution.
           * This makes sense when running a query with LIMIT
           * - there is a situation when all the necessary data has already been read,
-          *   but `children sources are still working,
+          *   but children sources are still working,
           *   herewith they can work in separate threads or even remotely.
           */
         cancel();
     }
 
     progress(Progress(res.rows(), res.bytes()));
+
+#ifndef NDEBUG
+    if (res)
+    {
+        Block header = getHeader();
+        if (header)
+            assertBlocksHaveEqualStructure(res, header, getName());
+    }
+#endif
 
     return res;
 }
@@ -78,15 +93,21 @@ void IProfilingBlockInputStream::readPrefix()
 {
     readPrefixImpl();
 
-    for (auto & child : children)
-        child->readPrefix();
+    forEachChild([&] (IBlockInputStream & child)
+    {
+        child.readPrefix();
+        return false;
+    });
 }
 
 
 void IProfilingBlockInputStream::readSuffix()
 {
-    for (auto & child : children)
-        child->readSuffix();
+    forEachChild([&] (IBlockInputStream & child)
+    {
+        child.readSuffix();
+        return false;
+    });
 
     readSuffixImpl();
 }
@@ -94,36 +115,48 @@ void IProfilingBlockInputStream::readSuffix()
 
 void IProfilingBlockInputStream::updateExtremes(Block & block)
 {
-    size_t columns = block.columns();
+    size_t num_columns = block.columns();
 
     if (!extremes)
     {
-        extremes = block.cloneEmpty();
+        MutableColumns extremes_columns(num_columns);
 
-        for (size_t i = 0; i < columns; ++i)
+        for (size_t i = 0; i < num_columns; ++i)
         {
-            Field min_value;
-            Field max_value;
+            const ColumnPtr & src = block.safeGetByPosition(i).column;
 
-            block.safeGetByPosition(i).column->getExtremes(min_value, max_value);
+            if (src->isColumnConst())
+            {
+                /// Equal min and max.
+                extremes_columns[i] = src->cloneResized(2);
+            }
+            else
+            {
+                Field min_value;
+                Field max_value;
 
-            ColumnPtr & column = extremes.safeGetByPosition(i).column;
+                src->getExtremes(min_value, max_value);
 
-            if (auto converted = column->convertToFullColumnIfConst())
-                column = converted;
+                extremes_columns[i] = src->cloneEmpty();
 
-            column->insert(min_value);
-            column->insert(max_value);
+                extremes_columns[i]->insert(min_value);
+                extremes_columns[i]->insert(max_value);
+            }
         }
+
+        extremes = block.cloneWithColumns(std::move(extremes_columns));
     }
     else
     {
-        for (size_t i = 0; i < columns; ++i)
+        for (size_t i = 0; i < num_columns; ++i)
         {
-            ColumnPtr & column = extremes.safeGetByPosition(i).column;
+            ColumnPtr & old_extremes = extremes.safeGetByPosition(i).column;
 
-            Field min_value = (*column)[0];
-            Field max_value = (*column)[1];
+            if (old_extremes->isColumnConst())
+                continue;
+
+            Field min_value = (*old_extremes)[0];
+            Field max_value = (*old_extremes)[1];
 
             Field cur_min_value;
             Field cur_max_value;
@@ -135,62 +168,63 @@ void IProfilingBlockInputStream::updateExtremes(Block & block)
             if (cur_max_value > max_value)
                 max_value = cur_max_value;
 
-            column = column->cloneEmpty();
-            column->insert(min_value);
-            column->insert(max_value);
+            MutableColumnPtr new_extremes = old_extremes->cloneEmpty();
+
+            new_extremes->insert(min_value);
+            new_extremes->insert(max_value);
+
+            old_extremes = std::move(new_extremes);
         }
     }
 }
 
 
-bool IProfilingBlockInputStream::checkLimits()
+static bool handleOverflowMode(OverflowMode mode, const String & message, int code)
+{
+    switch (mode)
+    {
+        case OverflowMode::THROW:
+            throw Exception(message, code);
+        case OverflowMode::BREAK:
+            return false;
+        default:
+            throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
+    }
+};
+
+bool IProfilingBlockInputStream::checkDataSizeLimits()
 {
     if (limits.mode == LIMITS_CURRENT)
     {
         /// Check current stream limitations (i.e. max_result_{rows,bytes})
 
         if (limits.max_rows_to_read && info.rows > limits.max_rows_to_read)
-        {
-            if (limits.read_overflow_mode == OverflowMode::THROW)
-                throw Exception(std::string("Limit for result rows")
+            return handleOverflowMode(limits.read_overflow_mode,
+                std::string("Limit for result rows")
                     + " exceeded: read " + toString(info.rows)
                     + " rows, maximum: " + toString(limits.max_rows_to_read),
-                    ErrorCodes::TOO_MUCH_ROWS);
-
-            if (limits.read_overflow_mode == OverflowMode::BREAK)
-                return false;
-
-            throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
-        }
+                ErrorCodes::TOO_MUCH_ROWS);
 
         if (limits.max_bytes_to_read && info.bytes > limits.max_bytes_to_read)
-        {
-            if (limits.read_overflow_mode == OverflowMode::THROW)
-                throw Exception(std::string("Limit for result bytes (uncompressed)")
+            return handleOverflowMode(limits.read_overflow_mode,
+                std::string("Limit for result bytes (uncompressed)")
                     + " exceeded: read " + toString(info.bytes)
                     + " bytes, maximum: " + toString(limits.max_bytes_to_read),
-                    ErrorCodes::TOO_MUCH_BYTES);
-
-            if (limits.read_overflow_mode == OverflowMode::BREAK)
-                return false;
-
-            throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
-        }
+                ErrorCodes::TOO_MUCH_BYTES);
     }
 
+    return true;
+}
+
+
+bool IProfilingBlockInputStream::checkTimeLimits()
+{
     if (limits.max_execution_time != 0
         && info.total_stopwatch.elapsed() > static_cast<UInt64>(limits.max_execution_time.totalMicroseconds()) * 1000)
-    {
-        if (limits.timeout_overflow_mode == OverflowMode::THROW)
-            throw Exception("Timeout exceeded: elapsed " + toString(info.total_stopwatch.elapsedSeconds())
+        return handleOverflowMode(limits.timeout_overflow_mode,
+            "Timeout exceeded: elapsed " + toString(info.total_stopwatch.elapsedSeconds())
                 + " seconds, maximum: " + toString(limits.max_execution_time.totalMicroseconds() / 1000000.0),
             ErrorCodes::TIMEOUT_EXCEEDED);
-
-        if (limits.timeout_overflow_mode == OverflowMode::BREAK)
-            return false;
-
-        throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
-    }
 
     return true;
 }
@@ -206,7 +240,7 @@ void IProfilingBlockInputStream::checkQuota(Block & block)
 
         case LIMITS_CURRENT:
         {
-            time_t current_time = time(0);
+            time_t current_time = time(nullptr);
             double total_elapsed = info.total_stopwatch.elapsedSeconds();
 
             quota->checkAndAddResultRowsBytes(current_time, block.rows(), block.bytes());
@@ -247,28 +281,36 @@ void IProfilingBlockInputStream::progressImpl(const Progress & value)
             && ((limits.max_rows_to_read && total_rows_estimate > limits.max_rows_to_read)
                 || (limits.max_bytes_to_read && bytes_processed > limits.max_bytes_to_read)))
         {
-            if (limits.read_overflow_mode == OverflowMode::THROW)
+            switch (limits.read_overflow_mode)
             {
-                if (limits.max_rows_to_read && total_rows_estimate > limits.max_rows_to_read)
-                    throw Exception("Limit for rows to read exceeded: " + toString(total_rows_estimate)
-                        + " rows read (or to read), maximum: " + toString(limits.max_rows_to_read),
-                        ErrorCodes::TOO_MUCH_ROWS);
-                else
-                    throw Exception("Limit for (uncompressed) bytes to read exceeded: " + toString(bytes_processed)
-                        + " bytes read, maximum: " + toString(limits.max_bytes_to_read),
-                        ErrorCodes::TOO_MUCH_BYTES);
-            }
-            else if (limits.read_overflow_mode == OverflowMode::BREAK)
-            {
-                /// For `break`, we will stop only if so many lines were actually read, and not just supposed to be read.
-                if ((limits.max_rows_to_read && rows_processed > limits.max_rows_to_read)
-                    || (limits.max_bytes_to_read && bytes_processed > limits.max_bytes_to_read))
+                case OverflowMode::THROW:
                 {
-                    cancel();
+                    if (limits.max_rows_to_read && total_rows_estimate > limits.max_rows_to_read)
+                        throw Exception("Limit for rows to read exceeded: " + toString(total_rows_estimate)
+                            + " rows read (or to read), maximum: " + toString(limits.max_rows_to_read),
+                            ErrorCodes::TOO_MUCH_ROWS);
+                    else
+                        throw Exception("Limit for (uncompressed) bytes to read exceeded: " + toString(bytes_processed)
+                            + " bytes read, maximum: " + toString(limits.max_bytes_to_read),
+                            ErrorCodes::TOO_MUCH_BYTES);
+                    break;
                 }
+
+                case OverflowMode::BREAK:
+                {
+                    /// For `break`, we will stop only if so many lines were actually read, and not just supposed to be read.
+                    if ((limits.max_rows_to_read && rows_processed > limits.max_rows_to_read)
+                        || (limits.max_bytes_to_read && bytes_processed > limits.max_bytes_to_read))
+                    {
+                        cancel();
+                    }
+
+                    break;
+                }
+
+                default:
+                    throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
             }
-            else
-                throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
         }
 
         size_t total_rows = process_list_elem->progress_in.total_rows;
@@ -302,7 +344,7 @@ void IProfilingBlockInputStream::progressImpl(const Progress & value)
 
         if (quota != nullptr && limits.mode == LIMITS_TOTAL)
         {
-            quota->checkAndAddReadRowsBytes(time(0), value.rows, value.bytes);
+            quota->checkAndAddReadRowsBytes(time(nullptr), value.rows, value.bytes);
         }
     }
 }
@@ -314,19 +356,23 @@ void IProfilingBlockInputStream::cancel()
     if (!is_cancelled.compare_exchange_strong(old_val, true, std::memory_order_seq_cst, std::memory_order_relaxed))
         return;
 
-    for (auto & child : children)
-        if (IProfilingBlockInputStream * p_child = dynamic_cast<IProfilingBlockInputStream *>(&*child))
-            p_child->cancel();
+    forEachProfilingChild([] (IProfilingBlockInputStream & child)
+    {
+        child.cancel();
+        return false;
+    });
 }
 
 
-void IProfilingBlockInputStream::setProgressCallback(ProgressCallback callback)
+void IProfilingBlockInputStream::setProgressCallback(const ProgressCallback & callback)
 {
     progress_callback = callback;
 
-    for (auto & child : children)
-        if (IProfilingBlockInputStream * p_child = dynamic_cast<IProfilingBlockInputStream *>(&*child))
-            p_child->setProgressCallback(callback);
+    forEachProfilingChild([&] (IProfilingBlockInputStream & child)
+    {
+        child.setProgressCallback(callback);
+        return false;
+    });
 }
 
 
@@ -334,73 +380,44 @@ void IProfilingBlockInputStream::setProcessListElement(ProcessListElement * elem
 {
     process_list_elem = elem;
 
-    for (auto & child : children)
-        if (IProfilingBlockInputStream * p_child = dynamic_cast<IProfilingBlockInputStream *>(&*child))
-            p_child->setProcessListElement(elem);
+    forEachProfilingChild([&] (IProfilingBlockInputStream & child)
+    {
+        child.setProcessListElement(elem);
+        return false;
+    });
 }
 
 
-const Block & IProfilingBlockInputStream::getTotals()
+Block IProfilingBlockInputStream::getTotals()
 {
     if (totals)
         return totals;
 
-    for (auto & child : children)
+    Block res;
+    forEachProfilingChild([&] (IProfilingBlockInputStream & child)
     {
-        if (IProfilingBlockInputStream * p_child = dynamic_cast<IProfilingBlockInputStream *>(&*child))
-        {
-            const Block & res = p_child->getTotals();
-            if (res)
-                return res;
-        }
-    }
-
-    return totals;
+        res = child.getTotals();
+        if (res)
+            return true;
+        return false;
+    });
+    return res;
 }
 
-const Block & IProfilingBlockInputStream::getExtremes() const
+Block IProfilingBlockInputStream::getExtremes()
 {
     if (extremes)
         return extremes;
 
-    for (const auto & child : children)
+    Block res;
+    forEachProfilingChild([&] (IProfilingBlockInputStream & child)
     {
-        if (const IProfilingBlockInputStream * p_child = dynamic_cast<const IProfilingBlockInputStream *>(&*child))
-        {
-            const Block & res = p_child->getExtremes();
-            if (res)
-                return res;
-        }
-    }
-
-    return extremes;
+        res = child.getExtremes();
+        if (res)
+            return true;
+        return false;
+    });
+    return res;
 }
-
-void IProfilingBlockInputStream::collectTotalRowsApprox()
-{
-    if (collected_total_rows_approx)
-        return;
-
-    collected_total_rows_approx = true;
-
-    for (auto & child : children)
-    {
-        if (IProfilingBlockInputStream * p_child = dynamic_cast<IProfilingBlockInputStream *>(&*child))
-        {
-            p_child->collectTotalRowsApprox();
-            total_rows_approx += p_child->total_rows_approx;
-        }
-    }
-}
-
-void IProfilingBlockInputStream::collectAndSendTotalRowsApprox()
-{
-    if (collected_total_rows_approx)
-        return;
-
-    collectTotalRowsApprox();
-    progressImpl(Progress(0, 0, total_rows_approx));
-}
-
 
 }

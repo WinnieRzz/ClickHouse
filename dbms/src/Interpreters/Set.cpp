@@ -1,15 +1,17 @@
 #include <Core/Field.h>
-#include <Core/FieldVisitors.h>
+#include <Common/FieldVisitors.h>
 #include <Core/Row.h>
 
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnTuple.h>
 
+#include <Common/typeid_cast.h>
+
 #include <DataStreams/IProfilingBlockInputStream.h>
-#include <DataStreams/OneBlockInputStream.h>
 
 #include <DataTypes/DataTypeArray.h>
-#include <Functions/DataTypeTraits.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeNullable.h>
 
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -48,7 +50,7 @@ bool Set::checkSetSizeLimits() const
 template <typename Method>
 void NO_INLINE Set::insertFromBlockImpl(
     Method & method,
-    const ConstColumnPlainPtrs & key_columns,
+    const ColumnRawPtrs & key_columns,
     size_t rows,
     SetVariants & variants,
     ConstNullMapPtr null_map)
@@ -63,7 +65,7 @@ void NO_INLINE Set::insertFromBlockImpl(
 template <typename Method, bool has_null_map>
 void NO_INLINE Set::insertFromBlockImplCase(
     Method & method,
-    const ConstColumnPlainPtrs & key_columns,
+    const ColumnRawPtrs & key_columns,
     size_t rows,
     SetVariants & variants,
     ConstNullMapPtr null_map)
@@ -81,22 +83,22 @@ void NO_INLINE Set::insertFromBlockImplCase(
         /// Obtain a key to insert to the set
         typename Method::Key key = state.getKey(key_columns, keys_size, i, key_sizes);
 
-        typename Method::Data::iterator it = method.data.find(key);
+        typename Method::Data::iterator it;
         bool inserted;
         method.data.emplace(key, it, inserted);
 
         if (inserted)
-            method.onNewKey(*it, keys_size, i, variants.string_pool);
+            method.onNewKey(*it, keys_size, variants.string_pool);
     }
 }
 
 
-bool Set::insertFromBlock(const Block & block, bool create_ordered_set)
+bool Set::insertFromBlock(const Block & block, bool fill_set_elements)
 {
-    Poco::ScopedWriteRWLock lock(rwlock);
+    std::unique_lock lock(rwlock);
 
     size_t keys_size = block.columns();
-    ConstColumnPlainPtrs key_columns;
+    ColumnRawPtrs key_columns;
     key_columns.reserve(keys_size);
 
     if (empty())
@@ -116,7 +118,7 @@ bool Set::insertFromBlock(const Block & block, bool create_ordered_set)
         if (empty())
             data_types.emplace_back(block.safeGetByPosition(i).type);
 
-        if (auto converted = key_columns.back()->convertToFullColumnIfConst())
+        if (ColumnPtr converted = key_columns.back()->convertToFullColumnIfConst())
         {
             materialized_columns.emplace_back(converted);
             key_columns.back() = materialized_columns.back().get();
@@ -133,19 +135,20 @@ bool Set::insertFromBlock(const Block & block, bool create_ordered_set)
       */
     if (keys_size == 1)
     {
-        if (const ColumnTuple * tuple = typeid_cast<const ColumnTuple *>(key_columns.back()))
+        const auto & col = block.getByPosition(0);
+        if (const DataTypeTuple * tuple = typeid_cast<const DataTypeTuple *>(col.type.get()))
         {
+            const ColumnTuple & column = typeid_cast<const ColumnTuple &>(*key_columns[0]);
+
             key_columns.pop_back();
-            const Columns & tuple_elements = tuple->getColumns();
+            const Columns & tuple_elements = column.getColumns();
             for (const auto & elem : tuple_elements)
                 key_columns.push_back(elem.get());
 
             if (empty())
             {
                 data_types.pop_back();
-                const Block & tuple_block = tuple->getData();
-                for (size_t i = 0, size = tuple_block.columns(); i < size; ++i)
-                    data_types.push_back(tuple_block.getByPosition(i).type);
+                data_types.insert(data_types.end(), tuple->getElements().begin(), tuple->getElements().end());
             }
         }
     }
@@ -173,29 +176,41 @@ bool Set::insertFromBlock(const Block & block, bool create_ordered_set)
 #undef M
     }
 
-    if (create_ordered_set)
+    if (fill_set_elements)
+    {
         for (size_t i = 0; i < rows; ++i)
-            ordered_set_elements->push_back((*key_columns[0])[i]); /// ordered_set for index works only for single key, not for tuples
+        {
+            std::vector<Field> new_set_elements;
+            for (size_t j = 0; j < keys_size; ++j)
+            {
+                new_set_elements.push_back((*key_columns[j])[i]);
+            }
+            set_elements->emplace_back(std::move(new_set_elements));
+        }
+    }
 
     if (!checkSetSizeLimits())
     {
-        if (overflow_mode == OverflowMode::THROW)
-            throw Exception("IN-set size exceeded."
-                " Rows: " + toString(data.getTotalRowCount()) +
-                ", limit: " + toString(max_rows) +
-                ". Bytes: " + toString(data.getTotalByteCount()) +
-                ", limit: " + toString(max_bytes) + ".",
-                ErrorCodes::SET_SIZE_LIMIT_EXCEEDED);
+        switch (overflow_mode)
+        {
+            case OverflowMode::THROW:
+                throw Exception("IN-set size exceeded."
+                    " Rows: " + toString(data.getTotalRowCount()) +
+                    ", limit: " + toString(max_rows) +
+                    ". Bytes: " + toString(data.getTotalByteCount()) +
+                    ", limit: " + toString(max_bytes) + ".",
+                    ErrorCodes::SET_SIZE_LIMIT_EXCEEDED);
 
-        if (overflow_mode == OverflowMode::BREAK)
-            return false;
+            case OverflowMode::BREAK:
+                return false;
 
-        throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
+            default:
+                throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
+        }
     }
 
     return true;
 }
-
 
 static Field extractValueFromNode(ASTPtr & node, const IDataType & type, const Context & context)
 {
@@ -213,75 +228,63 @@ static Field extractValueFromNode(ASTPtr & node, const IDataType & type, const C
 }
 
 
-void Set::createFromAST(const DataTypes & types, ASTPtr node, const Context & context, bool create_ordered_set)
+void Set::createFromAST(const DataTypes & types, ASTPtr node, const Context & context, bool fill_set_elements)
 {
-    data_types = types;
-
     /// Will form a block with values from the set.
-    Block block;
-    for (size_t i = 0, size = data_types.size(); i < size; ++i)
-    {
-        ColumnWithTypeAndName col;
-        col.type = data_types[i];
-        col.column = data_types[i]->createColumn();
-        col.name = "_" + toString(i);
 
-        block.insert(std::move(col));
-    }
+    size_t size = types.size();
+    MutableColumns columns(types.size());
+    for (size_t i = 0; i < size; ++i)
+        columns[i] = types[i]->createColumn();
 
     Row tuple_values;
     ASTExpressionList & list = typeid_cast<ASTExpressionList &>(*node);
-    for (ASTs::iterator it = list.children.begin(); it != list.children.end(); ++it)
+    for (auto & elem : list.children)
     {
-        if (data_types.size() == 1)
+        if (types.size() == 1)
         {
-            Field value = extractValueFromNode(*it, *data_types[0], context);
+            Field value = extractValueFromNode(elem, *types[0], context);
 
             if (!value.isNull())
-                block.safeGetByPosition(0).column->insert(value);
+                columns[0]->insert(value);
         }
-        else if (ASTFunction * func = typeid_cast<ASTFunction *>(it->get()))
+        else if (ASTFunction * func = typeid_cast<ASTFunction *>(elem.get()))
         {
             if (func->name != "tuple")
                 throw Exception("Incorrect element of set. Must be tuple.", ErrorCodes::INCORRECT_ELEMENT_OF_SET);
 
             size_t tuple_size = func->arguments->children.size();
-            if (tuple_size != data_types.size())
+            if (tuple_size != types.size())
                 throw Exception("Incorrect size of tuple in set.", ErrorCodes::INCORRECT_ELEMENT_OF_SET);
 
             if (tuple_values.empty())
                 tuple_values.resize(tuple_size);
 
-            size_t j = 0;
-            for (; j < tuple_size; ++j)
+            size_t i = 0;
+            for (; i < tuple_size; ++i)
             {
-                Field value = extractValueFromNode(func->arguments->children[j], *data_types[j], context);
+                Field value = extractValueFromNode(func->arguments->children[i], *types[i], context);
 
                 /// If at least one of the elements of the tuple has an impossible (outside the range of the type) value, then the entire tuple too.
                 if (value.isNull())
                     break;
 
-                tuple_values[j] = value;
+                tuple_values[i] = value;
             }
 
-            if (j == tuple_size)
-                for (j = 0; j < tuple_size; ++j)
-                    block.safeGetByPosition(j).column->insert(tuple_values[j]);
+            if (i == tuple_size)
+                for (i = 0; i < tuple_size; ++i)
+                    columns[i]->insert(tuple_values[i]);
         }
         else
             throw Exception("Incorrect element of set", ErrorCodes::INCORRECT_ELEMENT_OF_SET);
     }
 
-    if (create_ordered_set)
-        ordered_set_elements = OrderedSetElementsPtr(new OrderedSetElements());
+    Block block;
+    for (size_t i = 0, size = types.size(); i < size; ++i)
+        block.insert(ColumnWithTypeAndName(std::move(columns[i]), types[i], "_" + toString(i)));
 
-    insertFromBlock(block, create_ordered_set);
-
-    if (create_ordered_set)
-    {
-        std::sort(ordered_set_elements->begin(), ordered_set_elements->end());
-        ordered_set_elements->erase(std::unique(ordered_set_elements->begin(), ordered_set_elements->end()), ordered_set_elements->end());
-    }
+    insertFromBlock(block, fill_set_elements);
 }
 
 
@@ -292,11 +295,11 @@ ColumnPtr Set::execute(const Block & block, bool negative) const
     if (0 == num_key_columns)
         throw Exception("Logical error: no columns passed to Set::execute method.", ErrorCodes::LOGICAL_ERROR);
 
-    auto res = std::make_shared<ColumnUInt8>();
-    ColumnUInt8::Container_t & vec_res = res->getData();
+    auto res = ColumnUInt8::create();
+    ColumnUInt8::Container & vec_res = res->getData();
     vec_res.resize(block.safeGetByPosition(0).column->size());
 
-    Poco::ScopedReadRWLock lock(rwlock);
+    std::shared_lock lock(rwlock);
 
     /// If the set is empty.
     if (data_types.empty())
@@ -305,7 +308,7 @@ ColumnPtr Set::execute(const Block & block, bool negative) const
             memset(&vec_res[0], 1, vec_res.size());
         else
             memset(&vec_res[0], 0, vec_res.size());
-        return res;
+        return std::move(res);
     }
 
     const DataTypeArray * array_type = typeid_cast<const DataTypeArray *>(block.safeGetByPosition(0).type.get());
@@ -323,7 +326,7 @@ ColumnPtr Set::execute(const Block & block, bool negative) const
             throw Exception("Array(Nullable(...)) for left hand side of IN is not supported.", ErrorCodes::NOT_IMPLEMENTED);
 
         if (!array_type->getNestedType()->equals(*data_types[0]))
-            throw Exception(std::string() + "Types in section IN don't match: " + data_types[0]->getName() +
+            throw Exception("Types in section IN don't match: " + data_types[0]->getName() +
                 " on the right, " + array_type->getNestedType()->getName() + " on the left.",
                 ErrorCodes::TYPE_MISMATCH);
 
@@ -350,7 +353,7 @@ ColumnPtr Set::execute(const Block & block, bool negative) const
         }
 
         /// Remember the columns we will work with. Also check that the data types are correct.
-        ConstColumnPlainPtrs key_columns;
+        ColumnRawPtrs key_columns;
         key_columns.reserve(num_key_columns);
 
         /// The constant columns to the left of IN are not supported directly. For this, they first materialize.
@@ -360,13 +363,12 @@ ColumnPtr Set::execute(const Block & block, bool negative) const
         {
             key_columns.push_back(block.safeGetByPosition(i).column.get());
 
-            if (DataTypeTraits::removeNullable(data_types[i])->getName() !=
-                DataTypeTraits::removeNullable(block.safeGetByPosition(i).type)->getName())
+            if (!removeNullable(data_types[i])->equals(*removeNullable(block.safeGetByPosition(i).type)))
                 throw Exception("Types of column " + toString(i + 1) + " in section IN don't match: "
                     + data_types[i]->getName() + " on the right, " + block.safeGetByPosition(i).type->getName() +
                     " on the left.", ErrorCodes::TYPE_MISMATCH);
 
-            if (auto converted = key_columns.back()->convertToFullColumnIfConst())
+            if (ColumnPtr converted = key_columns.back()->convertToFullColumnIfConst())
             {
                 materialized_columns.emplace_back(converted);
                 key_columns.back() = materialized_columns.back().get();
@@ -381,15 +383,15 @@ ColumnPtr Set::execute(const Block & block, bool negative) const
         executeOrdinary(key_columns, vec_res, negative, null_map);
     }
 
-    return res;
+    return std::move(res);
 }
 
 
 template <typename Method>
 void NO_INLINE Set::executeImpl(
     Method & method,
-    const ConstColumnPlainPtrs & key_columns,
-    ColumnUInt8::Container_t & vec_res,
+    const ColumnRawPtrs & key_columns,
+    ColumnUInt8::Container & vec_res,
     bool negative,
     size_t rows,
     ConstNullMapPtr null_map) const
@@ -404,8 +406,8 @@ void NO_INLINE Set::executeImpl(
 template <typename Method, bool has_null_map>
 void NO_INLINE Set::executeImplCase(
     Method & method,
-    const ConstColumnPlainPtrs & key_columns,
-    ColumnUInt8::Container_t & vec_res,
+    const ColumnRawPtrs & key_columns,
+    ColumnUInt8::Container & vec_res,
     bool negative,
     size_t rows,
     ConstNullMapPtr null_map) const
@@ -433,9 +435,9 @@ void NO_INLINE Set::executeImplCase(
 template <typename Method>
 void NO_INLINE Set::executeArrayImpl(
     Method & method,
-    const ConstColumnPlainPtrs & key_columns,
-    const ColumnArray::Offsets_t & offsets,
-    ColumnUInt8::Container_t & vec_res,
+    const ColumnRawPtrs & key_columns,
+    const ColumnArray::Offsets & offsets,
+    ColumnUInt8::Container & vec_res,
     bool negative,
     size_t rows) const
 {
@@ -464,8 +466,8 @@ void NO_INLINE Set::executeArrayImpl(
 
 
 void Set::executeOrdinary(
-    const ConstColumnPlainPtrs & key_columns,
-    ColumnUInt8::Container_t & vec_res,
+    const ColumnRawPtrs & key_columns,
+    ColumnUInt8::Container & vec_res,
     bool negative,
     ConstNullMapPtr null_map) const
 {
@@ -484,10 +486,10 @@ void Set::executeOrdinary(
     }
 }
 
-void Set::executeArray(const ColumnArray * key_column, ColumnUInt8::Container_t & vec_res, bool negative) const
+void Set::executeArray(const ColumnArray * key_column, ColumnUInt8::Container & vec_res, bool negative) const
 {
     size_t rows = key_column->size();
-    const ColumnArray::Offsets_t & offsets = key_column->getOffsets();
+    const ColumnArray::Offsets & offsets = key_column->getOffsets();
     const IColumn & nested_column = key_column->getData();
 
     switch (data.type)
@@ -496,7 +498,7 @@ void Set::executeArray(const ColumnArray * key_column, ColumnUInt8::Container_t 
             break;
 #define M(NAME) \
         case SetVariants::Type::NAME: \
-            executeArrayImpl(*data.NAME, ConstColumnPlainPtrs{&nested_column}, offsets, vec_res, negative, rows); \
+            executeArrayImpl(*data.NAME, ColumnRawPtrs{&nested_column}, offsets, vec_res, negative, rows); \
             break;
     APPLY_FOR_SET_VARIANTS(M)
 #undef M
@@ -504,106 +506,104 @@ void Set::executeArray(const ColumnArray * key_column, ColumnUInt8::Container_t 
 }
 
 
-/// Return the BoolMask.
-/// The first element is whether the `range` element can be an element of a set.
-/// The second element is whether the element in the `range` range is not from the set.
-BoolMask Set::mayBeTrueInRange(const Range & range) const
+MergeTreeSetIndex::MergeTreeSetIndex(const SetElements & set_elements, std::vector<PKTuplePositionMapping> && index_mapping_)
+    : ordered_set(),
+    indexes_mapping(std::move(index_mapping_))
 {
-    if (!ordered_set_elements)
-        throw Exception("Ordered set in not created.");
+    std::sort(indexes_mapping.begin(), indexes_mapping.end(),
+        [](const PKTuplePositionMapping & l, const PKTuplePositionMapping & r)
+        {
+            return std::forward_as_tuple(l.pk_index, l.tuple_index) < std::forward_as_tuple(r.pk_index, r.tuple_index);
+        });
 
-    if (ordered_set_elements->empty())
-        return {false, true};
+    std::unique(
+        indexes_mapping.begin(), indexes_mapping.end(),
+        [](const PKTuplePositionMapping & l, const PKTuplePositionMapping & r)
+        {
+            return l.pk_index == r.pk_index;
+        });
 
-    /// Range (-inf; + inf)
-    if (!range.left_bounded && !range.right_bounded)
-        return {true, true};
-
-    const Field & left = range.left;
-    const Field & right = range.right;
-
-    /// Range (-inf; right|
-    if (!range.left_bounded)
+    for (size_t i = 0; i < set_elements.size(); ++i)
     {
-        if (range.right_included)
-            return {ordered_set_elements->front() <= right, true};
-        else
-            return {ordered_set_elements->front() < right, true};
+        std::vector<FieldWithInfinity> new_set_values;
+        for (size_t j = 0; j < indexes_mapping.size(); ++j)
+        {
+            new_set_values.push_back(FieldWithInfinity(set_elements[i][indexes_mapping[j].tuple_index]));
+        }
+        ordered_set.emplace_back(std::move(new_set_values));
     }
 
-    /// Range |left; +Inf)
-    if (!range.right_bounded)
-    {
-        if (range.left_included)
-            return {ordered_set_elements->back() >= left, true};
-        else
-            return {ordered_set_elements->back() > left, true};
-    }
-
-    /// Range from one value [left].
-    if (range.left_included && range.right_included && left == right)
-    {
-        if (std::binary_search(ordered_set_elements->begin(), ordered_set_elements->end(), left))
-            return {true, false};
-        else
-            return {false, true};
-    }
-
-    /// The first element of the set that is greater than or equal to `left`.
-    auto left_it = std::lower_bound(ordered_set_elements->begin(), ordered_set_elements->end(), left);
-
-    /// If `left` is not in the range (open range), then take the next element in the order of the set.
-    if (!range.left_included && left_it != ordered_set_elements->end() && *left_it == left)
-        ++left_it;
-
-    /// if the entire range is to the right of the set: `{ set } | range |`
-    if (left_it == ordered_set_elements->end())
-        return {false, true};
-
-    /// The first element of the set, which is strictly greater than `right`.
-    auto right_it = std::upper_bound(ordered_set_elements->begin(), ordered_set_elements->end(), right);
-
-    /// the whole range to the left of the set: `| range | { set }`
-    if (right_it == ordered_set_elements->begin())
-        return {false, true};
-
-    /// The last element of the set that is less than or equal to `right`.
-    --right_it;
-
-    /// If `right` does not enter the range (open range), then take the previous element in the order of the set.
-    if (!range.right_included && *right_it == right)
-    {
-        /// the entire range to the left of the set, although the open range is tangent to the set: `| range) { set }`
-        if (right_it == ordered_set_elements->begin())
-            return {false, true};
-
-        --right_it;
-    }
-
-    /// The range does not contain any keys from the set, although it is located somewhere in the middle relative to its elements: * * * * [ ] * * * *
-    if (right_it < left_it)
-        return {false, true};
-
-    return {true, true};
+    std::sort(ordered_set.begin(), ordered_set.end());
 }
 
-
-std::string Set::describe() const
+/** Return the BoolMask where:
+  * 1: the intersection of the set and the range is non-empty
+  * 2: the range contains elements not in the set
+  */
+BoolMask MergeTreeSetIndex::mayBeTrueInRange(const std::vector<Range> & key_ranges, const DataTypes & data_types)
 {
-    if (!ordered_set_elements)
-        return "{}";
+    std::vector<FieldWithInfinity> left_point;
+    std::vector<FieldWithInfinity> right_point;
+    left_point.reserve(indexes_mapping.size());
+    right_point.reserve(indexes_mapping.size());
 
-    bool first = true;
-    std::stringstream ss;
+    bool invert_left_infinities = false;
+    bool invert_right_infinities = false;
 
-    ss << "{";
-    for (const Field & f : *ordered_set_elements)
+    for (size_t i = 0; i < indexes_mapping.size(); ++i)
     {
-        ss << (first ? "" : ", ") << applyVisitor(FieldVisitorToString(), f);
-        first = false;
+        std::optional<Range> new_range = PKCondition::applyMonotonicFunctionsChainToRange(
+            key_ranges[indexes_mapping[i].pk_index],
+            indexes_mapping[i].functions,
+            data_types[indexes_mapping[i].pk_index]);
+
+        if (!new_range)
+            return {true, true};
+
+        /** A range that ends in (x, y, ..., +inf) exclusive is the same as a range
+          * that ends in (x, y, ..., -inf) inclusive and vice versa for the left bound.
+          */
+        if (new_range->left_bounded)
+        {
+            if (!new_range->left_included)
+                invert_left_infinities = true;
+
+            left_point.push_back(FieldWithInfinity(new_range->left));
+        }
+        else
+        {
+            if (invert_left_infinities)
+                left_point.push_back(FieldWithInfinity::getPlusinfinity());
+            else
+                left_point.push_back(FieldWithInfinity::getMinusInfinity());
+        }
+
+        if (new_range->right_bounded)
+        {
+            if (!new_range->right_included)
+                invert_right_infinities = true;
+
+            right_point.push_back(FieldWithInfinity(new_range->right));
+        }
+        else
+        {
+            if (invert_right_infinities)
+                right_point.push_back(FieldWithInfinity::getMinusInfinity());
+            else
+                right_point.push_back(FieldWithInfinity::getPlusinfinity());
+        }
     }
-    ss << "}";
-    return ss.str();
+
+    /** Because each parallelogram maps to a contiguous sequence of elements
+      * layed out in the lexicographically increasing order, the set intersects the range
+      * if and only if either bound coincides with an element or at least one element
+      * is between the lower bounds
+      */
+    auto left_lower = std::lower_bound(ordered_set.begin(), ordered_set.end(), left_point);
+    auto right_lower = std::lower_bound(ordered_set.begin(), ordered_set.end(), right_point);
+    return {left_lower != right_lower
+        || (left_lower != ordered_set.end() && *left_lower == left_point)
+        || (right_lower != ordered_set.end() && *right_lower == right_point), true};
 }
 
 }

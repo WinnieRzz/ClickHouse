@@ -1,7 +1,14 @@
 #include <Dictionaries/DictionaryStructure.h>
-#include <Common/StringUtils.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <Columns/IColumn.h>
+#include <Common/StringUtils/StringUtils.h>
+#include <IO/WriteHelpers.h>
 
+#include <ext/range.h>
+#include <numeric>
 #include <unordered_set>
+#include <unordered_map>
+
 
 namespace DB
 {
@@ -60,6 +67,7 @@ AttributeUnderlyingType getAttributeUnderlyingType(const std::string & type)
         { "UInt16", AttributeUnderlyingType::UInt16 },
         { "UInt32", AttributeUnderlyingType::UInt32 },
         { "UInt64", AttributeUnderlyingType::UInt64 },
+        { "UUID", AttributeUnderlyingType::UInt128 },
         { "Int8", AttributeUnderlyingType::Int8 },
         { "Int16", AttributeUnderlyingType::Int16 },
         { "Int32", AttributeUnderlyingType::Int32 },
@@ -89,6 +97,7 @@ std::string toString(const AttributeUnderlyingType type)
         case AttributeUnderlyingType::UInt16: return "UInt16";
         case AttributeUnderlyingType::UInt32: return "UInt32";
         case AttributeUnderlyingType::UInt64: return "UInt64";
+        case AttributeUnderlyingType::UInt128: return "UUID";
         case AttributeUnderlyingType::Int8: return "Int8";
         case AttributeUnderlyingType::Int16: return "Int16";
         case AttributeUnderlyingType::Int32: return "Int32";
@@ -101,16 +110,6 @@ std::string toString(const AttributeUnderlyingType type)
     throw Exception{
         "Unknown attribute_type " + toString(static_cast<int>(type)),
         ErrorCodes::ARGUMENT_OUT_OF_BOUND};
-}
-
-
-DictionaryLifetime::DictionaryLifetime(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
-{
-    const auto & lifetime_min_key = config_prefix + ".min";
-    const auto has_min = config.has(lifetime_min_key);
-
-    this->min_sec = has_min ? config.getInt(lifetime_min_key) : config.getInt(config_prefix);
-    this->max_sec = has_min ? config.getInt(config_prefix + ".max") : this->min_sec;
 }
 
 
@@ -169,7 +168,7 @@ DictionaryStructure::DictionaryStructure(const Poco::Util::AbstractConfiguration
 
 void DictionaryStructure::validateKeyTypes(const DataTypes & key_types) const
 {
-    if (key_types.size() != key.value().size())
+    if (key_types.size() != key->size())
         throw Exception{
             "Key structure does not match, expected " + getKeyDescription(),
             ErrorCodes::TYPE_MISMATCH};
@@ -219,24 +218,24 @@ bool DictionaryStructure::isKeySizeFixed() const
     if (!key)
         return true;
 
-    for (const auto key_i : * key)
+    for (const auto & key_i : *key)
         if (key_i.underlying_type == AttributeUnderlyingType::String)
             return false;
 
     return true;
 }
 
-std::size_t DictionaryStructure::getKeySize() const
+size_t DictionaryStructure::getKeySize() const
 {
-    return std::accumulate(std::begin(*key), std::end(*key), std::size_t{},
-        [] (const auto running_size, const auto & key_i) {return running_size + key_i.type->getSizeOfField(); });
+    return std::accumulate(std::begin(*key), std::end(*key), size_t{},
+        [] (const auto running_size, const auto & key_i) {return running_size + key_i.type->getSizeOfValueInMemory(); });
 }
 
 
 static void CheckAttributeKeys(const Poco::Util::AbstractConfiguration::Keys & keys)
 {
     static const std::unordered_set<std::string> valid_keys =
-        { "name", "type", "expression", "null_value", "hierarchical", "injective" };
+        { "name", "type", "expression", "null_value", "hierarchical", "injective", "is_object_id" };
 
     for (const auto & key : keys)
     {
@@ -284,20 +283,20 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
             try
             {
                 ReadBufferFromString null_value_buffer{null_value_string};
-                ColumnPtr column_with_null_value = type->createColumn();
+                auto column_with_null_value = type->createColumn();
                 type->deserializeTextEscaped(*column_with_null_value, null_value_buffer);
                 null_value = (*column_with_null_value)[0];
             }
-            catch (const std::exception & e)
+            catch (Exception & e)
             {
-                throw Exception{
-                    std::string{"Error parsing null_value: "} + e.what(),
-                    ErrorCodes::BAD_ARGUMENTS};
+                e.addMessage("error parsing null_value");
+                throw;
             }
         }
 
         const auto hierarchical = config.getBool(prefix + "hierarchical", false);
         const auto injective = config.getBool(prefix + "injective", false);
+        const auto is_object_id = config.getBool(prefix + "is_object_id", false);
         if (name.empty())
             throw Exception{
                 "Properties 'name' and 'type' of an attribute cannot be empty",
@@ -316,7 +315,7 @@ std::vector<DictionaryAttribute> DictionaryStructure::getAttributes(
         has_hierarchy = has_hierarchy || hierarchical;
 
         attributes.emplace_back(DictionaryAttribute{
-            name, underlying_type, type, expression, null_value, hierarchical, injective
+            name, underlying_type, type, expression, null_value, hierarchical, injective, is_object_id
         });
     }
 

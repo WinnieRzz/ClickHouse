@@ -6,7 +6,9 @@
 #include <functional>
 
 #include <Common/Exception.h>
+#include <Common/UInt128.h>
 #include <Core/Types.h>
+#include <Core/Defines.h>
 #include <common/strong_typedef.h>
 
 
@@ -27,6 +29,7 @@ STRONG_TYPEDEF(TupleBackend, Tuple); /// Array and Tuple are different types wit
 
 
 /** 32 is enough. Round number is used for alignment and for better arithmetic inside std::vector.
+  * NOTE: Actually, sizeof(std::string) is 32 when using libc++, so Field is 40 bytes.
   */
 #define DBMS_MIN_FIELD_SIZE 32
 
@@ -36,8 +39,8 @@ STRONG_TYPEDEF(TupleBackend, Tuple); /// Array and Tuple are different types wit
   *  is not generalized,
   *  but somewhat more efficient, and simpler.
   *
-  * Used to represent a unit value of one of several types in the RAM.
-  * Warning! Preferably, instead of single values, store the pieces of the columns. See Column.h
+  * Used to represent a single value of one of several types in memory.
+  * Warning! Prefer to use chunks of columns instead of single values. See Column.h
   */
 class Field
 {
@@ -51,6 +54,7 @@ public:
             UInt64  = 1,
             Int64   = 2,
             Float64 = 3,
+            UInt128 = 4,
 
             /// Non-POD types.
 
@@ -67,6 +71,7 @@ public:
             {
                 case Null:    return "Null";
                 case UInt64:  return "UInt64";
+                case UInt128: return "UInt128";
                 case Int64:   return "Int64";
                 case Float64: return "Float64";
                 case String:  return "String";
@@ -104,8 +109,7 @@ public:
     }
 
     template <typename T>
-    Field(T && rhs,
-        typename std::enable_if<!std::is_same<typename std::decay<T>::type, Field>::value, void>::type * unused = nullptr)
+    Field(T && rhs, std::integral_constant<int, Field::TypeToEnum<std::decay_t<T>>::value> * = nullptr)
     {
         createConcrete(std::forward<T>(rhs));
     }
@@ -165,10 +169,10 @@ public:
     }
 
     template <typename T>
-    typename std::enable_if<!std::is_same<typename std::decay<T>::type, Field>::value, Field &>::type
+    std::enable_if_t<!std::is_same_v<std::decay_t<T>, Field>, Field &>
     operator= (T && rhs)
     {
-        if (which != TypeToEnum<typename std::decay<T>::type>::value)
+        if (which != TypeToEnum<std::decay_t<T>>::value)
         {
             destroy();
             createConcrete(std::forward<T>(rhs));
@@ -193,21 +197,39 @@ public:
 
     template <typename T> T & get()
     {
-        using TWithoutRef = typename std::remove_reference<T>::type;
-        TWithoutRef * __attribute__((__may_alias__)) ptr = reinterpret_cast<TWithoutRef*>(storage);
+        using TWithoutRef = std::remove_reference_t<T>;
+        TWithoutRef * __attribute__((__may_alias__)) ptr = reinterpret_cast<TWithoutRef*>(&storage);
         return *ptr;
     };
 
     template <typename T> const T & get() const
     {
-        using TWithoutRef = typename std::remove_reference<T>::type;
-        const TWithoutRef * __attribute__((__may_alias__)) ptr = reinterpret_cast<const TWithoutRef*>(storage);
+        using TWithoutRef = std::remove_reference_t<T>;
+        const TWithoutRef * __attribute__((__may_alias__)) ptr = reinterpret_cast<const TWithoutRef*>(&storage);
         return *ptr;
     };
 
+    template <typename T> bool tryGet(T & result)
+    {
+        const Types::Which requested = TypeToEnum<std::decay_t<T>>::value;
+        if (which != requested)
+            return false;
+        result = get<T>();
+        return true;
+    }
+
+    template <typename T> bool tryGet(T & result) const
+    {
+        const Types::Which requested = TypeToEnum<std::decay_t<T>>::value;
+        if (which != requested)
+            return false;
+        result = get<T>();
+        return true;
+    }
+
     template <typename T> T & safeGet()
     {
-        const Types::Which requested = TypeToEnum<typename std::decay<T>::type>::value;
+        const Types::Which requested = TypeToEnum<std::decay_t<T>>::value;
         if (which != requested)
             throw Exception("Bad get: has " + std::string(getTypeName()) + ", requested " + std::string(Types::toString(requested)), ErrorCodes::BAD_GET);
         return get<T>();
@@ -215,7 +237,7 @@ public:
 
     template <typename T> const T & safeGet() const
     {
-        const Types::Which requested = TypeToEnum<typename std::decay<T>::type>::value;
+        const Types::Which requested = TypeToEnum<std::decay_t<T>>::value;
         if (which != requested)
             throw Exception("Bad get: has " + std::string(getTypeName()) + ", requested " + std::string(Types::toString(requested)), ErrorCodes::BAD_GET);
         return get<T>();
@@ -233,6 +255,7 @@ public:
         {
             case Types::Null:    return false;
             case Types::UInt64:  return get<UInt64>()  < rhs.get<UInt64>();
+            case Types::UInt128: return get<UInt128>() < rhs.get<UInt128>();
             case Types::Int64:   return get<Int64>()   < rhs.get<Int64>();
             case Types::Float64: return get<Float64>() < rhs.get<Float64>();
             case Types::String:  return get<String>()  < rhs.get<String>();
@@ -260,11 +283,13 @@ public:
         {
             case Types::Null:    return true;
             case Types::UInt64:  return get<UInt64>()  <= rhs.get<UInt64>();
+            case Types::UInt128: return get<UInt128>() <= rhs.get<UInt128>();
             case Types::Int64:   return get<Int64>()   <= rhs.get<Int64>();
             case Types::Float64: return get<Float64>() <= rhs.get<Float64>();
             case Types::String:  return get<String>()  <= rhs.get<String>();
             case Types::Array:   return get<Array>()   <= rhs.get<Array>();
             case Types::Tuple:   return get<Tuple>()   <= rhs.get<Tuple>();
+
 
             default:
                 throw Exception("Bad type of Field", ErrorCodes::BAD_TYPE_OF_FIELD);
@@ -286,10 +311,11 @@ public:
             case Types::Null:    return true;
             case Types::UInt64:
             case Types::Int64:
-            case Types::Float64: return get<UInt64>() == rhs.get<UInt64>();
-            case Types::String:  return get<String>() == rhs.get<String>();
-            case Types::Array:   return get<Array>()  == rhs.get<Array>();
-            case Types::Tuple:   return get<Tuple>()  == rhs.get<Tuple>();
+            case Types::Float64: return get<UInt64>()  == rhs.get<UInt64>();
+            case Types::String:  return get<String>()  == rhs.get<String>();
+            case Types::Array:   return get<Array>()   == rhs.get<Array>();
+            case Types::Tuple:   return get<Tuple>()   == rhs.get<Tuple>();
+            case Types::UInt128: return get<UInt128>() == rhs.get<UInt128>();
 
             default:
                 throw Exception("Bad type of Field", ErrorCodes::BAD_TYPE_OF_FIELD);
@@ -302,11 +328,10 @@ public:
     }
 
 private:
-    static const size_t storage_size = std::max({
-        DBMS_MIN_FIELD_SIZE - sizeof(Types::Which),
-        sizeof(Null), sizeof(UInt64), sizeof(Int64), sizeof(Float64), sizeof(String), sizeof(Array), sizeof(Tuple)});
+    std::aligned_union_t<DBMS_MIN_FIELD_SIZE - sizeof(Types::Which),
+        Null, UInt64, UInt128, Int64, Float64, String, Array, Tuple
+        > storage;
 
-    char storage[storage_size] __attribute__((aligned(8)));
     Types::Which which;
 
 
@@ -314,8 +339,8 @@ private:
     template <typename T>
     void createConcrete(T && x)
     {
-        using JustT = typename std::decay<T>::type;
-        JustT * __attribute__((__may_alias__)) ptr = reinterpret_cast<JustT *>(storage);
+        using JustT = std::decay_t<T>;
+        JustT * __attribute__((__may_alias__)) ptr = reinterpret_cast<JustT *>(&storage);
         new (ptr) JustT(std::forward<T>(x));
         which = TypeToEnum<JustT>::value;
     }
@@ -324,8 +349,8 @@ private:
     template <typename T>
     void assignConcrete(T && x)
     {
-        using JustT = typename std::decay<T>::type;
-        JustT * __attribute__((__may_alias__)) ptr = reinterpret_cast<JustT *>(storage);
+        using JustT = std::decay_t<T>;
+        JustT * __attribute__((__may_alias__)) ptr = reinterpret_cast<JustT *>(&storage);
         *ptr = std::forward<T>(x);
     }
 
@@ -337,6 +362,7 @@ private:
         {
             case Types::Null:    f(field.template get<Null>());    return;
             case Types::UInt64:  f(field.template get<UInt64>());  return;
+            case Types::UInt128: f(field.template get<UInt128>()); return;
             case Types::Int64:   f(field.template get<Int64>());   return;
             case Types::Float64: f(field.template get<Float64>()); return;
             case Types::String:  f(field.template get<String>());  return;
@@ -372,7 +398,7 @@ private:
 
     void create(const char * data, size_t size)
     {
-        String * __attribute__((__may_alias__)) ptr = reinterpret_cast<String*>(storage);
+        String * __attribute__((__may_alias__)) ptr = reinterpret_cast<String*>(&storage);
         new (ptr) String(data, size);
         which = Types::String;
     }
@@ -382,7 +408,7 @@ private:
         create(reinterpret_cast<const char *>(data), size);
     }
 
-    __attribute__((__always_inline__)) void destroy()
+    ALWAYS_INLINE void destroy()
     {
         if (which < Types::MIN_NON_POD)
             return;
@@ -408,7 +434,7 @@ private:
     template <typename T>
     void destroy()
     {
-        T * __attribute__((__may_alias__)) ptr = reinterpret_cast<T*>(storage);
+        T * __attribute__((__may_alias__)) ptr = reinterpret_cast<T*>(&storage);
         ptr->~T();
     }
 };
@@ -418,6 +444,7 @@ private:
 
 template <> struct Field::TypeToEnum<Null>    { static const Types::Which value = Types::Null; };
 template <> struct Field::TypeToEnum<UInt64>  { static const Types::Which value = Types::UInt64; };
+template <> struct Field::TypeToEnum<UInt128> { static const Types::Which value = Types::UInt128; };
 template <> struct Field::TypeToEnum<Int64>   { static const Types::Which value = Types::Int64; };
 template <> struct Field::TypeToEnum<Float64> { static const Types::Which value = Types::Float64; };
 template <> struct Field::TypeToEnum<String>  { static const Types::Which value = Types::String; };
@@ -426,6 +453,7 @@ template <> struct Field::TypeToEnum<Tuple>   { static const Types::Which value 
 
 template <> struct Field::EnumToType<Field::Types::Null>    { using Type = Null; };
 template <> struct Field::EnumToType<Field::Types::UInt64>  { using Type = UInt64; };
+template <> struct Field::EnumToType<Field::Types::UInt128> { using Type = UInt128; };
 template <> struct Field::EnumToType<Field::Types::Int64>   { using Type = Int64; };
 template <> struct Field::EnumToType<Field::Types::Float64> { using Type = Float64; };
 template <> struct Field::EnumToType<Field::Types::String>  { using Type = String; };
@@ -468,6 +496,7 @@ template <> struct NearestFieldType<UInt8>   { using Type = UInt64; };
 template <> struct NearestFieldType<UInt16>  { using Type = UInt64; };
 template <> struct NearestFieldType<UInt32>  { using Type = UInt64; };
 template <> struct NearestFieldType<UInt64>  { using Type = UInt64; };
+template <> struct NearestFieldType<UInt128> { using Type = UInt128; };
 template <> struct NearestFieldType<Int8>    { using Type = Int64; };
 template <> struct NearestFieldType<Int16>   { using Type = Int64; };
 template <> struct NearestFieldType<Int32>   { using Type = Int64; };
@@ -494,25 +523,24 @@ class WriteBuffer;
 /// It is assumed that all elements of the array have the same type.
 void readBinary(Array & x, ReadBuffer & buf);
 
-inline void readText(Array & x, ReadBuffer & buf) { throw Exception("Cannot read Array.", ErrorCodes::NOT_IMPLEMENTED); }
-inline void readQuoted(Array & x, ReadBuffer & buf) { throw Exception("Cannot read Array.", ErrorCodes::NOT_IMPLEMENTED); }
+inline void readText(Array &, ReadBuffer &) { throw Exception("Cannot read Array.", ErrorCodes::NOT_IMPLEMENTED); }
+inline void readQuoted(Array &, ReadBuffer &) { throw Exception("Cannot read Array.", ErrorCodes::NOT_IMPLEMENTED); }
 
 /// It is assumed that all elements of the array have the same type.
 void writeBinary(const Array & x, WriteBuffer & buf);
 
 void writeText(const Array & x, WriteBuffer & buf);
 
-inline void writeQuoted(const Array & x, WriteBuffer & buf) { throw Exception("Cannot write Array quoted.", ErrorCodes::NOT_IMPLEMENTED); }
+inline void writeQuoted(const Array &, WriteBuffer &) { throw Exception("Cannot write Array quoted.", ErrorCodes::NOT_IMPLEMENTED); }
 
 void readBinary(Tuple & x, ReadBuffer & buf);
 
-inline void readText(Tuple & x, ReadBuffer & buf) { throw Exception("Cannot read Tuple.", ErrorCodes::NOT_IMPLEMENTED); }
-inline void readQuoted(Tuple & x, ReadBuffer & buf) { throw Exception("Cannot read Tuple.", ErrorCodes::NOT_IMPLEMENTED); }
+inline void readText(Tuple &, ReadBuffer &) { throw Exception("Cannot read Tuple.", ErrorCodes::NOT_IMPLEMENTED); }
+inline void readQuoted(Tuple &, ReadBuffer &) { throw Exception("Cannot read Tuple.", ErrorCodes::NOT_IMPLEMENTED); }
 
 void writeBinary(const Tuple & x, WriteBuffer & buf);
 
 void writeText(const Tuple & x, WriteBuffer & buf);
 
-inline void writeQuoted(const Tuple & x, WriteBuffer & buf) { throw Exception("Cannot write Tuple quoted.", ErrorCodes::NOT_IMPLEMENTED); }
-
+inline void writeQuoted(const Tuple &, WriteBuffer &) { throw Exception("Cannot write Tuple quoted.", ErrorCodes::NOT_IMPLEMENTED); }
 }

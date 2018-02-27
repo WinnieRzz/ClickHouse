@@ -10,19 +10,20 @@ namespace ErrorCodes
     extern const int INCORRECT_DATA;
     extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
     extern const int CANNOT_READ_ALL_DATA;
+    extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
 }
 
 
-TSKVRowInputStream::TSKVRowInputStream(ReadBuffer & istr_, const Block & sample_, bool skip_unknown_)
-    : istr(istr_), sample(sample_), skip_unknown(skip_unknown_), name_map(sample.columns())
+TSKVRowInputStream::TSKVRowInputStream(ReadBuffer & istr_, const Block & header_, bool skip_unknown_)
+    : istr(istr_), header(header_), skip_unknown(skip_unknown_), name_map(header.columns())
 {
     /// In this format, we assume that column name cannot contain BOM,
     ///  so BOM at beginning of stream cannot be confused with name of field, and it is safe to skip it.
     skipBOMIfExists(istr);
 
-    size_t columns = sample.columns();
-    for (size_t i = 0; i < columns; ++i)
-        name_map[sample.safeGetByPosition(i).name] = i;        /// NOTE You could place names more cache-locally.
+    size_t num_columns = header.columns();
+    for (size_t i = 0; i < num_columns; ++i)
+        name_map[header.safeGetByPosition(i).name] = i;        /// NOTE You could place names more cache-locally.
 }
 
 
@@ -85,17 +86,17 @@ static bool readName(ReadBuffer & buf, StringRef & ref, String & tmp)
 }
 
 
-bool TSKVRowInputStream::read(Block & block)
+bool TSKVRowInputStream::read(MutableColumns & columns)
 {
     if (istr.eof())
         return false;
 
-    size_t columns = block.columns();
+    size_t num_columns = columns.size();
 
     /// Set of columns for which the values were read. The rest will be filled with default values.
     /// TODO Ability to provide your DEFAULTs.
-    bool read_columns[columns];
-    memset(read_columns, 0, columns);
+    bool read_columns[num_columns];
+    memset(read_columns, 0, num_columns);
 
     if (unlikely(*istr.position() == '\n'))
     {
@@ -108,6 +109,7 @@ bool TSKVRowInputStream::read(Block & block)
         {
             StringRef name_ref;
             bool has_value = readName(istr, name_ref, name_buf);
+            ssize_t index = -1;
 
             if (has_value)
             {
@@ -126,15 +128,14 @@ bool TSKVRowInputStream::read(Block & block)
                 }
                 else
                 {
-                    size_t index = it->second;
+                    index = it->second;
 
                     if (read_columns[index])
                         throw Exception("Duplicate field found while parsing TSKV format: " + name_ref.toString(), ErrorCodes::INCORRECT_DATA);
 
                     read_columns[index] = true;
 
-                    auto & col = block.getByPosition(index);
-                    col.type.get()->deserializeTextEscaped(*col.column.get(), istr);
+                    header.getByPosition(index).type->deserializeTextEscaped(*columns[index], istr);
                 }
             }
             else
@@ -159,14 +160,23 @@ bool TSKVRowInputStream::read(Block & block)
                 break;
             }
             else
-                throw Exception("Found garbage after field in TSKV format: " + name_ref.toString(), ErrorCodes::INCORRECT_DATA);
+            {
+                /// Possibly a garbage was written into column, remove it
+                if (index >= 0)
+                {
+                    columns[index]->popBack(1);
+                    read_columns[index] = false;
+                }
+
+                throw Exception("Found garbage after field in TSKV format: " + name_ref.toString(), ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED);
+            }
         }
     }
 
     /// Fill in the not met columns with default values.
-    for (size_t i = 0; i < columns; ++i)
+    for (size_t i = 0; i < num_columns; ++i)
         if (!read_columns[i])
-            block.getByPosition(i).column.get()->insertDefault();
+            header.getByPosition(i).type->insertDefaultInto(*columns[i]);
 
     return true;
 }

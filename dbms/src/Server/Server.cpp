@@ -3,195 +3,58 @@
 #include <memory>
 #include <sys/resource.h>
 #include <Poco/DirectoryIterator.h>
-#include <Poco/Net/DNS.h>
-#include <Poco/Net/HTTPServerRequest.h>
+#include <Poco/Net/HTTPServer.h>
 #include <Poco/Net/NetException.h>
-#include <Poco/Util/XMLConfiguration.h>
-#include <common/ApplicationServerExt.h>
+#include <ext/scope_guard.h>
+#include <common/logger_useful.h>
 #include <common/ErrorHandlers.h>
-#include <ext/scope_guard.hpp>
-#include <zkutil/ZooKeeper.h>
-#include <zkutil/ZooKeeperNodeCache.h>
+#include <common/getMemoryAmount.h>
+#include <Common/ClickHouseRevision.h>
+#include <Common/CurrentMetrics.h>
 #include <Common/Macros.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperNodeCache.h>
+#include <Common/config.h>
 #include <Common/getFQDNOrHostName.h>
 #include <Common/getMultipleKeysFromConfig.h>
-#include <Databases/DatabaseOrdinary.h>
+#include <Common/getNumberOfPhysicalCPUCores.h>
 #include <IO/HTTPCommon.h>
 #include <Interpreters/AsynchronousMetrics.h>
+#include <Interpreters/DDLWorker.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/loadMetadata.h>
-#include <Storages/MergeTree/ReshardingWorker.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/System/attachSystemTables.h>
+#include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Functions/registerFunctions.h>
+#include <TableFunctions/registerTableFunctions.h>
+#include <Storages/registerStorages.h>
 #include "ConfigReloader.h"
-#include "HTTPHandler.h"
-#include "InterserverIOHTTPHandler.h"
+#include "HTTPHandlerFactory.h"
 #include "MetricsTransmitter.h"
-#include "ReplicasStatusHandler.h"
 #include "StatusFile.h"
-#include "TCPHandler.h"
+#include "TCPHandlerFactory.h"
 
-#include <Common/config.h>
 #if Poco_NetSSL_FOUND
 #include <Poco/Net/Context.h>
 #include <Poco/Net/SecureServerSocket.h>
 #endif
 
-#include <Functions/registerFunctions.h>
-#include <AggregateFunctions/registerAggregateFunctions.h>
-
+namespace CurrentMetrics
+{
+    extern const Metric Revision;
+}
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
     extern const int NO_ELEMENTS_IN_CONFIG;
     extern const int SUPPORT_IS_DISABLED;
+    extern const int ARGUMENT_OUT_OF_BOUND;
 }
-
-
-/// Response with "Ok.\n". Used for availability checks.
-class PingRequestHandler : public Poco::Net::HTTPRequestHandler
-{
-public:
-    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
-    {
-        try
-        {
-            setResponseDefaultHeaders(response);
-            const char * data = "Ok.\n";
-            response.sendBuffer(data, strlen(data));
-        }
-        catch (...)
-        {
-            tryLogCurrentException("PingRequestHandler");
-        }
-    }
-};
-
-/// Response with custom string. Can be used for browser.
-class RootRequestHandler : public Poco::Net::HTTPRequestHandler
-{
-public:
-    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
-    {
-        try
-        {
-            setResponseDefaultHeaders(response);
-            response.setContentType("text/html; charset=UTF-8");
-            const std::string data = Poco::Util::Application::instance().config().getString("http_server_default_response", "Ok.\n");
-            response.sendBuffer(data.data(), data.size());
-        }
-        catch (...)
-        {
-            tryLogCurrentException("RootRequestHandler");
-        }
-    }
-};
-
-
-/// Response with 404 and verbose description.
-class NotFoundHandler : public Poco::Net::HTTPRequestHandler
-{
-public:
-    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
-    {
-        try
-        {
-            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
-            response.send() << "There is no handle " << request.getURI() << "\n\n"
-                            << "Use / or /ping for health checks.\n"
-                            << "Or /replicas_status for more sophisticated health checks.\n\n"
-                            << "Send queries from your program with POST method or GET /?query=...\n\n"
-                            << "Use clickhouse-client:\n\n"
-                            << "For interactive data analysis:\n"
-                            << "    clickhouse-client\n\n"
-                            << "For batch query processing:\n"
-                            << "    clickhouse-client --query='SELECT 1' > result\n"
-                            << "    clickhouse-client < query > result\n";
-        }
-        catch (...)
-        {
-            tryLogCurrentException("NotFoundHandler");
-        }
-    }
-};
-
-
-template <typename HandlerType>
-class HTTPRequestHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory
-{
-private:
-    Server & server;
-    Logger * log;
-    std::string name;
-
-public:
-    HTTPRequestHandlerFactory(Server & server_, const std::string & name_) : server(server_), log(&Logger::get(name_)), name(name_)
-    {
-    }
-
-    Poco::Net::HTTPRequestHandler * createRequestHandler(const Poco::Net::HTTPServerRequest & request) override
-    {
-        LOG_TRACE(log,
-            "HTTP Request for " << name << ". "
-                                << "Method: "
-                                << request.getMethod()
-                                << ", Address: "
-                                << request.clientAddress().toString()
-                                << ", User-Agent: "
-                                << (request.has("User-Agent") ? request.get("User-Agent") : "none"));
-
-        const auto & uri = request.getURI();
-
-        if (request.getMethod() == Poco::Net::HTTPRequest::HTTP_GET || request.getMethod() == Poco::Net::HTTPRequest::HTTP_HEAD)
-        {
-            if (uri == "/")
-                return new RootRequestHandler;
-            if (uri == "/ping")
-                return new PingRequestHandler;
-            else if (startsWith(uri, "/replicas_status"))
-                return new ReplicasStatusHandler(*server.global_context);
-        }
-
-        if (uri.find('?') != std::string::npos || request.getMethod() == Poco::Net::HTTPRequest::HTTP_POST)
-        {
-            return new HandlerType(server);
-        }
-
-        if (request.getMethod() == Poco::Net::HTTPRequest::HTTP_GET || request.getMethod() == Poco::Net::HTTPRequest::HTTP_HEAD
-            || request.getMethod() == Poco::Net::HTTPRequest::HTTP_POST)
-        {
-            return new NotFoundHandler;
-        }
-
-        return nullptr;
-    }
-};
-
-
-class TCPConnectionFactory : public Poco::Net::TCPServerConnectionFactory
-{
-private:
-    Server & server;
-    Logger * log;
-
-public:
-    TCPConnectionFactory(Server & server_) : server(server_), log(&Logger::get("TCPConnectionFactory"))
-    {
-    }
-
-    Poco::Net::TCPServerConnection * createConnection(const Poco::Net::StreamSocket & socket) override
-    {
-        LOG_TRACE(log,
-            "TCP Request. "
-                << "Address: "
-                << socket.peerAddress().toString());
-
-        return new TCPHandler(server, socket);
-    }
-};
 
 
 static std::string getCanonicalPath(std::string && path)
@@ -204,22 +67,38 @@ static std::string getCanonicalPath(std::string && path)
     return path;
 }
 
+void Server::uninitialize()
+{
+    logger().information("shutting down");
+    BaseDaemon::uninitialize();
+}
+
+void Server::initialize(Poco::Util::Application & self)
+{
+    BaseDaemon::initialize(self);
+    logger().information("starting up");
+}
+
 std::string Server::getDefaultCorePath() const
 {
     return getCanonicalPath(config().getString("path")) + "cores";
 }
 
-int Server::main(const std::vector<std::string> & args)
+int Server::main(const std::vector<std::string> & /*args*/)
 {
     Logger * log = &logger();
 
     registerFunctions();
     registerAggregateFunctions();
+    registerTableFunctions();
+    registerStorages();
+
+    CurrentMetrics::set(CurrentMetrics::Revision, ClickHouseRevision::get());
 
     /** Context contains all that query execution is dependent:
       *  settings, available functions, data types, aggregate functions, databases...
       */
-    global_context = std::make_unique<Context>();
+    global_context = std::make_unique<Context>(Context::createGlobal());
     global_context->setGlobalContext(*global_context);
     global_context->setApplicationType(Context::ApplicationType::SERVER);
 
@@ -234,8 +113,10 @@ int Server::main(const std::vector<std::string> & args)
     if (loaded_config.has_zk_includes)
     {
         auto old_configuration = loaded_config.configuration;
-        loaded_config = ConfigProcessor().loadConfigWithZooKeeperIncludes(
-            config_path, main_config_zk_node_cache, /* fallback_to_preprocessed = */ true);
+        ConfigProcessor config_processor(config_path);
+        loaded_config = config_processor.loadConfigWithZooKeeperIncludes(
+            main_config_zk_node_cache, /* fallback_to_preprocessed = */ true);
+        config_processor.savePreprocessedConfig(loaded_config);
         config().removeConfiguration(old_configuration.get());
         config().add(loaded_config.configuration.duplicate(), PRIO_DEFAULT, false);
     }
@@ -250,6 +131,15 @@ int Server::main(const std::vector<std::string> & args)
     Poco::File(path + "metadata/" + default_database).createDirectories();
 
     StatusFile status{path + "status"};
+
+    SCOPE_EXIT({
+        /** Explicitly destroy Context. It is more convenient than in destructor of Server, because logger is still available.
+          * At this moment, no one could own shared part of Context.
+          */
+        global_context.reset();
+
+        LOG_DEBUG(log, "Destroyed global context.");
+    });
 
     /// Try to increase limit on number of open files.
     {
@@ -268,9 +158,9 @@ int Server::main(const std::vector<std::string> & args)
             int rc = setrlimit(RLIMIT_NOFILE, &rlim);
             if (rc != 0)
                 LOG_WARNING(log,
-                    std::string("Cannot set max number of file descriptors to ") + std::to_string(rlim.rlim_cur)
-                        + ". Try to specify max_open_files according to your system limits. error: "
-                        + strerror(errno));
+                    "Cannot set max number of file descriptors to " << rlim.rlim_cur
+                        << ". Try to specify max_open_files according to your system limits. error: "
+                        << strerror(errno));
             else
                 LOG_DEBUG(log, "Set max number of file descriptors to " << rlim.rlim_cur << " (was " << old << ").");
         }
@@ -357,7 +247,7 @@ int Server::main(const std::vector<std::string> & args)
         [&](ConfigurationPtr config) { global_context->setUsersConfig(config); },
         /* already_loaded = */ false);
 
-    /// Limit on total number of coucurrently executed queries.
+    /// Limit on total number of concurrently executed queries.
     global_context->getProcessList().setMaxSize(config().getInt("max_concurrent_queries", 0));
 
     /// Setup protection to avoid accidental DROP for big tables (that are greater than 50 GB by default)
@@ -369,48 +259,29 @@ int Server::main(const std::vector<std::string> & args)
     if (uncompressed_cache_size)
         global_context->setUncompressedCache(uncompressed_cache_size);
 
+    /// Load global settings from default_profile and system_profile.
+    global_context->setDefaultProfiles(config());
+    Settings & settings = global_context->getSettingsRef();
+
     /// Size of cache for marks (index of MergeTree family of tables). It is necessary.
     size_t mark_cache_size = config().getUInt64("mark_cache_size");
     if (mark_cache_size)
         global_context->setMarkCache(mark_cache_size);
 
-    /// Load global settings from default profile.
-    Settings & settings = global_context->getSettingsRef();
-    String default_profile_name = config().getString("default_profile", "default");
-    global_context->setDefaultProfileName(default_profile_name);
-    global_context->setSetting("profile", default_profile_name);
+    /// Set path for format schema files
+    auto format_schema_path = Poco::File(config().getString("format_schema_path", path + "format_schemas/"));
+    global_context->setFormatSchemaPath(format_schema_path.path() + "/");
+    format_schema_path.createDirectories();
 
     LOG_INFO(log, "Loading metadata.");
+    loadMetadataSystem(*global_context);
+    /// After the system database is created, attach virtual system tables (in addition to query_log and part_log)
+    attachSystemTablesServer(*global_context->getDatabase("system"), has_zookeeper);
+    /// Then, load remaining databases
     loadMetadata(*global_context);
     LOG_DEBUG(log, "Loaded metadata.");
 
     global_context->setCurrentDatabase(default_database);
-
-    /// Create system tables.
-    if (!global_context->isDatabaseExist("system"))
-    {
-        Poco::File(path + "data/system").createDirectories();
-        Poco::File(path + "metadata/system").createDirectories();
-
-        auto system_database = std::make_shared<DatabaseOrdinary>("system", path + "metadata/system/");
-        global_context->addDatabase("system", system_database);
-
-        /// 'has_force_restore_data_flag' is true, to not fail on loading query_log table, if it is corrupted.
-        system_database->loadTables(*global_context, nullptr, true);
-    }
-
-    DatabasePtr system_database = global_context->getDatabase("system");
-
-    attachSystemTablesServer(system_database, global_context.get(), has_zookeeper);
-
-    bool has_resharding_worker = false;
-    if (has_zookeeper && config().has("resharding"))
-    {
-        auto resharding_worker = std::make_shared<ReshardingWorker>(config(), "resharding", *global_context);
-        global_context->setReshardingWorker(resharding_worker);
-        resharding_worker->start();
-        has_resharding_worker = true;
-    }
 
     SCOPE_EXIT({
         /** Ask to cancel background jobs all table engines,
@@ -421,40 +292,37 @@ int Server::main(const std::vector<std::string> & args)
         LOG_INFO(log, "Shutting down storages.");
         global_context->shutdown();
         LOG_DEBUG(log, "Shutted down storages.");
-
-        /** Explicitly destroy Context. It is more convenient than in destructor of Server, becuase logger is still available.
-          * At this moment, no one could own shared part of Context.
-          */
-        global_context.reset();
-
-        LOG_DEBUG(log, "Destroyed global context.");
     });
 
+    if (has_zookeeper && config().has("distributed_ddl"))
     {
-        Poco::Timespan keep_alive_timeout(config().getInt("keep_alive_timeout", 10), 0);
+        /// DDL worker should be started after all tables were loaded
+        String ddl_zookeeper_path = config().getString("distributed_ddl.path", "/clickhouse/task_queue/ddl/");
+        global_context->setDDLWorker(std::make_shared<DDLWorker>(ddl_zookeeper_path, *global_context, &config(), "distributed_ddl"));
+    }
 
-        Poco::ThreadPool server_pool(3, config().getInt("max_connections", 1024));
+    {
+        Poco::Timespan keep_alive_timeout(config().getUInt("keep_alive_timeout", 10), 0);
+
+        Poco::ThreadPool server_pool(3, config().getUInt("max_connections", 1024));
         Poco::Net::HTTPServerParams::Ptr http_params = new Poco::Net::HTTPServerParams;
         http_params->setTimeout(settings.receive_timeout);
         http_params->setKeepAliveTimeout(keep_alive_timeout);
 
         std::vector<std::unique_ptr<Poco::Net::TCPServer>> servers;
 
-        std::vector<std::string> listen_hosts;
-        for (const auto & key : DB::getMultipleKeysFromConfig(config(), "", "listen_host"))
-        {
-            listen_hosts.emplace_back(config().getString(key));
-        }
+        std::vector<std::string> listen_hosts = DB::getMultipleValuesFromConfig(config(), "", "listen_host");
 
-        bool try_listen = false;
+        bool listen_try = config().getUInt("listen_try", false);
         if (listen_hosts.empty())
         {
             listen_hosts.emplace_back("::1");
             listen_hosts.emplace_back("127.0.0.1");
-            try_listen = true;
+            listen_try = true;
         }
 
-        auto make_socket_address = [&](const std::string & host, std::uint16_t port) {
+        auto make_socket_address = [&](const std::string & host, UInt16 port)
+        {
             Poco::Net::SocketAddress socket_address;
             try
             {
@@ -490,11 +358,14 @@ int Server::main(const std::vector<std::string> & args)
                 {
                     Poco::Net::SocketAddress http_socket_address = make_socket_address(listen_host, config().getInt("http_port"));
                     Poco::Net::ServerSocket http_socket(http_socket_address);
-                    http_socket.setReceiveTimeout(settings.receive_timeout);
-                    http_socket.setSendTimeout(settings.send_timeout);
+                    http_socket.setReceiveTimeout(settings.http_receive_timeout);
+                    http_socket.setSendTimeout(settings.http_send_timeout);
 
                     servers.emplace_back(new Poco::Net::HTTPServer(
-                        new HTTPRequestHandlerFactory<HTTPHandler>(*this, "HTTPHandler-factory"), server_pool, http_socket, http_params));
+                        new HTTPHandlerFactory(*this, "HTTPHandler-factory"),
+                        server_pool,
+                        http_socket,
+                        http_params));
 
                     LOG_INFO(log, "Listening http://" + http_socket_address.toString());
                 }
@@ -502,34 +373,61 @@ int Server::main(const std::vector<std::string> & args)
                 /// HTTPS
                 if (config().has("https_port"))
                 {
-                #if Poco_NetSSL_FOUND
+#if Poco_NetSSL_FOUND
                     std::call_once(ssl_init_once, SSLInit);
                     Poco::Net::SocketAddress http_socket_address = make_socket_address(listen_host, config().getInt("https_port"));
                     Poco::Net::SecureServerSocket http_socket(http_socket_address);
-                    http_socket.setReceiveTimeout(settings.receive_timeout);
-                    http_socket.setSendTimeout(settings.send_timeout);
+                    http_socket.setReceiveTimeout(settings.http_receive_timeout);
+                    http_socket.setSendTimeout(settings.http_send_timeout);
 
                     servers.emplace_back(new Poco::Net::HTTPServer(
-                        new HTTPRequestHandlerFactory<HTTPHandler>(*this, "HTTPHandler-factory"), server_pool, http_socket, http_params));
+                        new HTTPHandlerFactory(*this, "HTTPHandler-factory"),
+                        server_pool,
+                        http_socket,
+                        http_params));
 
                     LOG_INFO(log, "Listening https://" + http_socket_address.toString());
-                #else
-                    throw Exception{"https protocol disabled because poco library built without NetSSL support.",
+#else
+                    throw Exception{"HTTPS protocol is disabled because Poco library was built without NetSSL support.",
                         ErrorCodes::SUPPORT_IS_DISABLED};
-                #endif
+#endif
                 }
 
                 /// TCP
                 if (config().has("tcp_port"))
                 {
+                    std::call_once(ssl_init_once, SSLInit);
                     Poco::Net::SocketAddress tcp_address = make_socket_address(listen_host, config().getInt("tcp_port"));
                     Poco::Net::ServerSocket tcp_socket(tcp_address);
                     tcp_socket.setReceiveTimeout(settings.receive_timeout);
                     tcp_socket.setSendTimeout(settings.send_timeout);
-                    servers.emplace_back(
-                        new Poco::Net::TCPServer(new TCPConnectionFactory(*this), server_pool, tcp_socket, new Poco::Net::TCPServerParams));
+                    servers.emplace_back(new Poco::Net::TCPServer(
+                        new TCPHandlerFactory(*this),
+                        server_pool,
+                        tcp_socket,
+                        new Poco::Net::TCPServerParams));
 
                     LOG_INFO(log, "Listening tcp: " + tcp_address.toString());
+                }
+
+                /// TCP with SSL
+                if (config().has("tcp_ssl_port"))
+                {
+#if Poco_NetSSL_FOUND
+                    Poco::Net::SocketAddress tcp_address = make_socket_address(listen_host, config().getInt("tcp_ssl_port"));
+                    Poco::Net::SecureServerSocket tcp_socket(tcp_address);
+                    tcp_socket.setReceiveTimeout(settings.receive_timeout);
+                    tcp_socket.setSendTimeout(settings.send_timeout);
+                    servers.emplace_back(new Poco::Net::TCPServer(
+                        new TCPHandlerFactory(*this),
+                                                                  server_pool,
+                                                                  tcp_socket,
+                                                                  new Poco::Net::TCPServerParams));
+                    LOG_INFO(log, "Listening tcp_ssl: " + tcp_address.toString());
+#else
+                    throw Exception{"SSL support for TCP protocol is disabled because Poco library was built without NetSSL support.",
+                        ErrorCodes::SUPPORT_IS_DISABLED};
+#endif
                 }
 
                 /// At least one of TCP and HTTP servers must be created.
@@ -541,10 +439,10 @@ int Server::main(const std::vector<std::string> & args)
                 {
                     Poco::Net::SocketAddress interserver_address = make_socket_address(listen_host, config().getInt("interserver_http_port"));
                     Poco::Net::ServerSocket interserver_io_http_socket(interserver_address);
-                    interserver_io_http_socket.setReceiveTimeout(settings.receive_timeout);
-                    interserver_io_http_socket.setSendTimeout(settings.send_timeout);
+                    interserver_io_http_socket.setReceiveTimeout(settings.http_receive_timeout);
+                    interserver_io_http_socket.setSendTimeout(settings.http_send_timeout);
                     servers.emplace_back(new Poco::Net::HTTPServer(
-                        new HTTPRequestHandlerFactory<InterserverIOHTTPHandler>(*this, "InterserverIOHTTPHandler-factory"),
+                        new InterserverIOHTTPHandlerFactory(*this, "InterserverIOHTTPHandler-factory"),
                         server_pool,
                         interserver_io_http_socket,
                         http_params));
@@ -554,7 +452,7 @@ int Server::main(const std::vector<std::string> & args)
             }
             catch (const Poco::Net::NetException & e)
             {
-                if (try_listen && e.code() == POCO_EPROTONOSUPPORT)
+                if (listen_try && (e.code() == POCO_EPROTONOSUPPORT || e.code() == POCO_EADDRNOTAVAIL))
                     LOG_ERROR(log, "Listen [" << listen_host << "]: " << e.what() << ": " << e.message()
                         << "  If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to "
                         "specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration "
@@ -563,7 +461,6 @@ int Server::main(const std::vector<std::string> & args)
                 else
                     throw;
             }
-
         }
 
         if (servers.empty())
@@ -572,20 +469,19 @@ int Server::main(const std::vector<std::string> & args)
         for (auto & server : servers)
             server->start();
 
+        {
+            std::stringstream message;
+            message << "Available RAM = " << formatReadableSizeWithBinarySuffix(getMemoryAmount()) << ";"
+                << " physical cores = " << getNumberOfPhysicalCPUCores() << ";"
+                // on ARM processors it can show only enabled at current moment cores
+                << " threads = " <<  std::thread::hardware_concurrency() << ".";
+            LOG_INFO(log, message.str());
+        }
+
         LOG_INFO(log, "Ready for connections.");
 
         SCOPE_EXIT({
             LOG_DEBUG(log, "Received termination signal.");
-
-            if (has_resharding_worker)
-            {
-                LOG_INFO(log, "Shutting down resharding thread");
-                auto & resharding_worker = global_context->getReshardingWorker();
-                if (resharding_worker.isStarted())
-                    resharding_worker.shutdown();
-                LOG_DEBUG(log, "Shut down resharding thread");
-            }
-
             LOG_DEBUG(log, "Waiting for current connections to close.");
 
             is_cancelled = true;
@@ -599,7 +495,7 @@ int Server::main(const std::vector<std::string> & args)
 
             LOG_DEBUG(log,
                 "Closed all listening sockets."
-                    << (current_connections ? " Waiting for " + std::to_string(current_connections) + " outstanding connections." : ""));
+                    << (current_connections ? " Waiting for " + toString(current_connections) + " outstanding connections." : ""));
 
             if (current_connections)
             {
@@ -619,7 +515,7 @@ int Server::main(const std::vector<std::string> & args)
             }
 
             LOG_DEBUG(
-                log, "Closed connections." << (current_connections ? " But " + std::to_string(current_connections) + " remains."
+                log, "Closed connections." << (current_connections ? " But " + toString(current_connections) + " remains."
                     " Tip: To increase wait time add to config: <shutdown_wait_unfinished>60</shutdown_wait_unfinished>" : ""));
 
             main_config_reloader.reset();
@@ -643,14 +539,16 @@ int Server::main(const std::vector<std::string> & args)
 
         /// This object will periodically calculate some metrics.
         AsynchronousMetrics async_metrics(*global_context);
-
-        attachSystemTablesAsync(system_database, async_metrics);
+        attachSystemTablesAsync(*global_context->getDatabase("system"), async_metrics);
 
         std::vector<std::unique_ptr<MetricsTransmitter>> metrics_transmitters;
         for (const auto & graphite_key : DB::getMultipleKeysFromConfig(config(), "", "graphite"))
         {
-            metrics_transmitters.emplace_back(std::make_unique<MetricsTransmitter>(async_metrics, graphite_key));
+            metrics_transmitters.emplace_back(std::make_unique<MetricsTransmitter>(
+                *global_context, async_metrics, graphite_key));
         }
+
+        SessionCleaner session_cleaner(*global_context);
 
         waitForTerminationRequest();
     }
@@ -659,4 +557,17 @@ int Server::main(const std::vector<std::string> & args)
 }
 }
 
-YANDEX_APP_SERVER_MAIN_FUNC(DB::Server, mainEntryClickHouseServer);
+int mainEntryClickHouseServer(int argc, char ** argv)
+{
+    DB::Server app;
+    try
+    {
+        return app.run(argc, argv);
+    }
+    catch (...)
+    {
+        std::cerr << DB::getCurrentExceptionMessage(true) << "\n";
+        auto code = DB::getCurrentExceptionCode();
+        return code ? code : 1;
+    }
+}

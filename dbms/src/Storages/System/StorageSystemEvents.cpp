@@ -11,34 +11,28 @@ namespace DB
 
 
 StorageSystemEvents::StorageSystemEvents(const std::string & name_)
-    : name(name_),
-    columns
+    : name(name_)
+{
+    columns = NamesAndTypesList
     {
-        {"event",         std::make_shared<DataTypeString>()},
-        {"value",        std::make_shared<DataTypeUInt64>()}
-    }
-{
-}
-
-StoragePtr StorageSystemEvents::create(const std::string & name_)
-{
-    return make_shared(name_);
+        {"event", std::make_shared<DataTypeString>()},
+        {"value", std::make_shared<DataTypeUInt64>()}
+    };
 }
 
 
 BlockInputStreams StorageSystemEvents::read(
     const Names & column_names,
-    ASTPtr query,
-    const Context & context,
-    const Settings & settings,
+    const SelectQueryInfo &,
+    const Context &,
     QueryProcessingStage::Enum & processed_stage,
-    const size_t max_block_size,
-    const unsigned threads)
+    const size_t /*max_block_size*/,
+    const unsigned /*num_streams*/)
 {
     check(column_names);
     processed_stage = QueryProcessingStage::FetchColumns;
 
-    Block block = getSampleBlock();
+    MutableColumns res_columns = getSampleBlock().cloneEmptyColumns();
 
     for (size_t i = 0, end = ProfileEvents::end(); i < end; ++i)
     {
@@ -46,12 +40,12 @@ BlockInputStreams StorageSystemEvents::read(
 
         if (0 != value)
         {
-            block.getByPosition(0).column->insert(String(ProfileEvents::getDescription(ProfileEvents::Event(i))));
-            block.getByPosition(1).column->insert(value);
+            res_columns[0]->insert(String(ProfileEvents::getDescription(ProfileEvents::Event(i))));
+            res_columns[1]->insert(value);
         }
     }
 
-    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(block));
+    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(getSampleBlock().cloneWithColumns(std::move(res_columns))));
 }
 
 

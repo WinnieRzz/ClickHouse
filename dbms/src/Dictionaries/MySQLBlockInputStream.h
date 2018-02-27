@@ -21,15 +21,10 @@ public:
 
     String getName() const override { return "MySQL"; }
 
-    String getID() const override;
+    Block getHeader() const override { return description.sample_block; };
 
 private:
     Block readImpl() override;
-
-    static void insertDefaultValue(IColumn * const column, const IColumn & sample_column)
-    {
-        column->insertFrom(sample_column, 0);
-    }
 
     mysqlxx::PoolWithFailover::Entry entry;
     mysqlxx::Query query;

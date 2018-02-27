@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Core/Progress.h>
+#include <IO/Progress.h>
 
 #include <Interpreters/Limits.h>
 
@@ -26,7 +26,11 @@ using ProfilingBlockInputStreamPtr = std::shared_ptr<IProfilingBlockInputStream>
   */
 class IProfilingBlockInputStream : public IBlockInputStream
 {
+    friend struct BlockStreamProfileInfo;
+
 public:
+    IProfilingBlockInputStream();
+
     Block read() override final;
 
     /** The default implementation calls readPrefixImpl() on itself, and then readPrefix() recursively for all children.
@@ -54,10 +58,10 @@ public:
       * Call this method only after all the data has been retrieved with `read`,
       *  otherwise there will be problems if any data at the same time is computed in another thread.
       */
-    virtual const Block & getTotals();
+    virtual Block getTotals();
 
     /// The same for minimums and maximums.
-    const Block & getExtremes() const;
+    Block getExtremes();
 
 
     /** Set the execution progress bar callback.
@@ -67,7 +71,7 @@ public:
       * The function takes the number of rows in the last block, the number of bytes in the last block.
       * Note that the callback can be called from different threads.
       */
-    void setProgressCallback(ProgressCallback callback);
+    void setProgressCallback(const ProgressCallback & callback);
 
 
     /** In this method:
@@ -96,7 +100,7 @@ public:
 
     /** Set the approximate total number of rows to read.
       */
-    void setTotalRowsApprox(size_t value) { total_rows_approx = value; }
+    void addTotalRowsApprox(size_t value) { total_rows_approx += value; }
 
 
     /** Ask to abort the receipt of data as soon as possible.
@@ -172,18 +176,22 @@ protected:
     ProgressCallback progress_callback;
     ProcessListElement * process_list_elem = nullptr;
 
-    bool enabled_extremes = false;
-
     /// Additional information that can be generated during the work process.
 
     /// Total values during aggregation.
     Block totals;
     /// Minimums and maximums. The first row of the block - minimums, the second - the maximums.
     Block extremes;
-    /// The approximate total number of rows to read. For progress bar.
-    size_t total_rows_approx = 0;
-    /// Information about the approximate total number of rows is collected in the parent source.
-    bool collected_total_rows_approx = false;
+
+
+    void addChild(BlockInputStreamPtr & child)
+    {
+        std::lock_guard lock(children_mutex);
+        children.push_back(child);
+    }
+
+private:
+    bool enabled_extremes = false;
 
     /// The limit on the number of rows/bytes has been exceeded, and you need to stop execution on the next `read` call, as if the thread has run out.
     bool limit_exceeded_need_break = false;
@@ -195,7 +203,10 @@ protected:
     QuotaForIntervals * quota = nullptr;    /// If nullptr - the quota is not used.
     double prev_elapsed = 0;
 
-    /// The heirs must implement this function.
+    /// The approximate total number of rows to read. For progress bar.
+    size_t total_rows_approx = 0;
+
+    /// The successors must implement this function.
     virtual Block readImpl() = 0;
 
     /// Here you can do a preliminary initialization.
@@ -209,16 +220,20 @@ protected:
     /** Check constraints and quotas.
       * But only those that can be tested within each separate source.
       */
-    bool checkLimits();
+    bool checkDataSizeLimits();
+    bool checkTimeLimits();
     void checkQuota(Block & block);
 
-    /// Gather information about the approximate total number of rows from all children.
-    void collectTotalRowsApprox();
 
-    /** Send information about the approximate total number of rows to the progress bar.
-      * It is done so that sending occurs only in the upper source.
-      */
-    void collectAndSendTotalRowsApprox();
+    template <typename F>
+    void forEachProfilingChild(F && f)
+    {
+        std::lock_guard lock(children_mutex);
+        for (auto & child : children)
+            if (IProfilingBlockInputStream * p_child = dynamic_cast<IProfilingBlockInputStream *>(child.get()))
+                if (f(*p_child))
+                    return;
+    }
 };
 
 }

@@ -1,4 +1,4 @@
-#include <Core/FieldVisitors.h>
+#include <Common/FieldVisitors.h>
 #include <DataStreams/CollapsingSortedBlockInputStream.h>
 #include <Columns/ColumnsNumber.h>
 
@@ -12,6 +12,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INCORRECT_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 
@@ -26,7 +27,7 @@ void CollapsingSortedBlockInputStream::reportIncorrectData()
     {
         if (i != 0)
             s << ", ";
-        s << applyVisitor(FieldVisitorToString(), (*current_key.columns[i])[current_key.row_num]);
+        s << applyVisitor(FieldVisitorToString(), (*(*current_key.columns)[i])[current_key.row_num]);
     }
 
     s << ").";
@@ -39,51 +40,52 @@ void CollapsingSortedBlockInputStream::reportIncorrectData()
 }
 
 
-void CollapsingSortedBlockInputStream::insertRows(ColumnPlainPtrs & merged_columns, size_t & merged_rows, bool last_in_stream)
+void CollapsingSortedBlockInputStream::insertRows(MutableColumns & merged_columns, size_t & merged_rows, bool last_in_stream)
 {
-    if (count_positive != 0 || count_negative != 0)
+    if (count_positive == 0 && count_negative == 0)
+        return;
+
+    if (count_positive == count_negative && !last_is_positive)
     {
-        if (count_positive == count_negative && !last_is_positive)
+        /// If all the rows in the input streams was collapsed, we still want to give at least one block in the result.
+        if (last_in_stream && merged_rows == 0 && !blocks_written)
         {
-            /// If all the rows in the input streams collapsed, we still want to give at least one block in the result.
-            if (last_in_stream && merged_rows == 0 && !blocks_written)
+            LOG_INFO(log, "All rows collapsed");
+            ++merged_rows;
+            for (size_t i = 0; i < num_columns; ++i)
+                merged_columns[i]->insertFrom(*(*last_positive.columns)[i], last_positive.row_num);
+            ++merged_rows;
+            for (size_t i = 0; i < num_columns; ++i)
+                merged_columns[i]->insertFrom(*(*last_negative.columns)[i], last_negative.row_num);
+
+            if (out_row_sources_buf)
             {
-                LOG_INFO(log, "All rows collapsed");
-                ++merged_rows;
-                for (size_t i = 0; i < num_columns; ++i)
-                    merged_columns[i]->insertFrom(*last_positive.columns[i], last_positive.row_num);
-                ++merged_rows;
-                for (size_t i = 0; i < num_columns; ++i)
-                    merged_columns[i]->insertFrom(*last_negative.columns[i], last_negative.row_num);
-
-                if (out_row_sources)
-                {
-                    /// true flag value means "skip row"
-                    out_row_sources->data()[last_positive_pos].setSkipFlag(false);
-                    out_row_sources->data()[last_negative_pos].setSkipFlag(false);
-                }
+                /// true flag value means "skip row"
+                current_row_sources[last_positive_pos].setSkipFlag(false);
+                current_row_sources[last_negative_pos].setSkipFlag(false);
             }
-            return;
         }
-
+    }
+    else
+    {
         if (count_positive <= count_negative)
         {
             ++merged_rows;
             for (size_t i = 0; i < num_columns; ++i)
-                merged_columns[i]->insertFrom(*first_negative.columns[i], first_negative.row_num);
+                merged_columns[i]->insertFrom(*(*first_negative.columns)[i], first_negative.row_num);
 
-            if (out_row_sources)
-                out_row_sources->data()[first_negative_pos].setSkipFlag(false);
+            if (out_row_sources_buf)
+                current_row_sources[first_negative_pos].setSkipFlag(false);
         }
 
         if (count_positive >= count_negative)
         {
             ++merged_rows;
             for (size_t i = 0; i < num_columns; ++i)
-                merged_columns[i]->insertFrom(*last_positive.columns[i], last_positive.row_num);
+                merged_columns[i]->insertFrom(*(*last_positive.columns)[i], last_positive.row_num);
 
-            if (out_row_sources)
-                out_row_sources->data()[last_positive_pos].setSkipFlag(false);
+            if (out_row_sources_buf)
+                current_row_sources[last_positive_pos].setSkipFlag(false);
         }
 
         if (!(count_positive == count_negative || count_positive + 1 == count_negative || count_positive == count_negative + 1))
@@ -93,60 +95,54 @@ void CollapsingSortedBlockInputStream::insertRows(ColumnPlainPtrs & merged_colum
             ++count_incorrect_data;
         }
     }
+
+    if (out_row_sources_buf)
+        out_row_sources_buf->write(
+            reinterpret_cast<const char *>(current_row_sources.data()),
+            current_row_sources.size() * sizeof(RowSourcePart));
 }
 
 
 Block CollapsingSortedBlockInputStream::readImpl()
 {
     if (finished)
-        return Block();
+        return {};
 
     if (children.size() == 1)
         return children[0]->read();
 
-    Block merged_block;
-    ColumnPlainPtrs merged_columns;
+    Block header;
+    MutableColumns merged_columns;
 
-    init(merged_block, merged_columns);
+    init(header, merged_columns);
+
+    if (has_collation)
+        throw Exception("Logical error: " + getName() + " does not support collations", ErrorCodes::LOGICAL_ERROR);
+
     if (merged_columns.empty())
-        return Block();
+        return {};
 
     /// Additional initialization.
     if (first_negative.empty())
-    {
-        first_negative.columns.resize(num_columns);
-        last_negative.columns.resize(num_columns);
-        last_positive.columns.resize(num_columns);
+        sign_column_number = header.getPositionByName(sign_column);
 
-        sign_column_number = merged_block.getPositionByName(sign_column);
-    }
 
-    if (has_collation)
-        merge(merged_columns, queue_with_collation);
-    else
-        merge(merged_columns, queue);
-
-    return merged_block;
+    merge(merged_columns, queue);
+    return header.cloneWithColumns(std::move(merged_columns));
 }
 
 
-template<class TSortCursor>
-void CollapsingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue)
+void CollapsingSortedBlockInputStream::merge(MutableColumns & merged_columns, std::priority_queue<SortCursor> & queue)
 {
     size_t merged_rows = 0;
 
-    /// Take rows in correct order and put them into `merged_block` until the rows no more than `max_block_size`
+    /// Take rows in correct order and put them into `merged_columns` until the rows no more than `max_block_size`
     for (; !queue.empty(); ++current_pos)
     {
-        TSortCursor current = queue.top();
+        SortCursor current = queue.top();
 
         if (current_key.empty())
-        {
-            current_key.columns.resize(description.size());
-            next_key.columns.resize(description.size());
-
             setPrimaryKeyRef(current_key, current);
-        }
 
         Int8 sign = static_cast<const ColumnInt8 &>(*current->all_columns[sign_column_number]).getData()[current->pos];
         setPrimaryKeyRef(next_key, current);
@@ -162,10 +158,6 @@ void CollapsingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, s
 
         queue.pop();
 
-        /// Initially, skip all rows. On insert, unskip "corner" rows.
-        if (out_row_sources)
-            out_row_sources->emplace_back(current.impl->order, true);
-
         if (key_differs)
         {
             /// We write data for the previous primary key.
@@ -175,7 +167,17 @@ void CollapsingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, s
 
             count_negative = 0;
             count_positive = 0;
+
+            current_pos = 0;
+            first_negative_pos = 0;
+            last_positive_pos = 0;
+            last_negative_pos = 0;
+            current_row_sources.resize(0);
         }
+
+        /// Initially, skip all rows. On insert, unskip "corner" rows.
+        if (out_row_sources_buf)
+            current_row_sources.emplace_back(current.impl->order, true);
 
         if (sign == 1)
         {

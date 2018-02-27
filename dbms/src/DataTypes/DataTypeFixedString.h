@@ -2,6 +2,8 @@
 
 #include <DataTypes/IDataType.h>
 
+#define MAX_FIXEDSTRING_SIZE 0xFFFFFF
+
 
 namespace DB
 {
@@ -18,18 +20,19 @@ private:
     size_t n;
 
 public:
+    static constexpr bool is_parametric = true;
+
     DataTypeFixedString(size_t n_) : n(n_)
     {
         if (n == 0)
             throw Exception("FixedString size must be positive", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+        if (n > MAX_FIXEDSTRING_SIZE)
+            throw Exception("FixedString size is too large", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
     }
 
     std::string getName() const override;
 
-    DataTypePtr clone() const override
-    {
-        return std::make_shared<DataTypeFixedString>(n);
-    }
+    const char * getFamilyName() const override { return "FixedString"; }
 
     size_t getN() const
     {
@@ -52,7 +55,7 @@ public:
     void serializeTextQuoted(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
     void deserializeTextQuoted(IColumn & column, ReadBuffer & istr) const override;
 
-    void serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, bool) const override;
+    void serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettingsJSON &) const override;
     void deserializeTextJSON(IColumn & column, ReadBuffer & istr) const override;
 
     void serializeTextXML(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
@@ -60,13 +63,24 @@ public:
     void serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
     void deserializeTextCSV(IColumn & column, ReadBuffer & istr, const char delimiter) const override;
 
-    ColumnPtr createColumn() const override;
-    ColumnPtr createConstColumn(size_t size, const Field & field) const override;
+    MutableColumnPtr createColumn() const override;
 
     Field getDefault() const override
     {
         return String();
     }
+
+    bool equals(const IDataType & rhs) const override;
+
+    bool isParametric() const override { return true; }
+    bool haveSubtypes() const override { return false; }
+    bool isComparable() const override { return true; };
+    bool isValueUnambiguouslyRepresentedInContiguousMemoryRegion() const override { return true; }
+    bool isFixedString() const override { return true; };
+    bool haveMaximumSizeOfValue() const override { return true; }
+    size_t getSizeOfValueInMemory() const override { return n; }
+    bool isCategorial() const override { return true; }
+    bool canBeInsideNullable() const override { return true; }
 };
 
 }

@@ -1,7 +1,4 @@
-include_directories (include)
-include(${ClickHouse_SOURCE_DIR}/cmake/dbms_include.cmake)
-
-add_library (daemon
+add_library (daemon ${SPLIT_SHARED}
     src/BaseDaemon.cpp
     src/GraphiteWriter.cpp
     src/OwnPatternFormatter.cpp
@@ -11,4 +8,13 @@ add_library (daemon
     include/daemon/OwnPatternFormatter.h
 )
 
-target_link_libraries (daemon dbms)
+if (USE_UNWIND)
+    target_compile_definitions (daemon PRIVATE USE_UNWIND=1)
+    target_include_directories (daemon BEFORE PRIVATE ${UNWIND_INCLUDE_DIR})
+    target_link_libraries (daemon ${UNWIND_LIBRARY})
+endif ()
+
+target_include_directories (daemon PUBLIC include)
+target_include_directories (daemon PRIVATE ${ClickHouse_SOURCE_DIR}/libs/libpocoext/include)
+
+target_link_libraries (daemon clickhouse_common_io clickhouse_common_configprocessor ${EXECINFO_LIBRARY})

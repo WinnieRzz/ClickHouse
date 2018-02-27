@@ -12,7 +12,6 @@
 #include <IO/WriteHelpers.h>
 #include <Common/PODArray.h>
 #include <Poco/Exception.h>
-#include <boost/random.hpp>
 
 
  /// Implementation of Reservoir Sampling algorithm. Incrementally selects from the added objects a random subset of the `sample_count` size.
@@ -211,7 +210,8 @@ private:
         if (sorted)
             return;
         sorted = true;
-        std::sort(samples.begin(), samples.end(), [] (const std::pair<T, UInt32> & lhs, const std::pair<T, UInt32> & rhs) {
+        std::sort(samples.begin(), samples.end(), [] (const std::pair<T, UInt32> & lhs, const std::pair<T, UInt32> & rhs)
+        {
             return lhs.first < rhs.first;
         });
     }
@@ -222,6 +222,6 @@ private:
         if (OnEmpty == ReservoirSamplerDeterministicOnEmpty::THROW)
             throw Poco::Exception("Quantile of empty ReservoirSamplerDeterministic");
         else
-            return NanLikeValueConstructor<ResultType, std::is_floating_point<ResultType>::value>::getValue();
+            return NanLikeValueConstructor<ResultType, std::is_floating_point_v<ResultType>>::getValue();
     }
 };

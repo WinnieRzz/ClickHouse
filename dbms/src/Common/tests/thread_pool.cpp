@@ -1,11 +1,11 @@
-#include <Common/ThreadPool.h>
+#include <common/ThreadPool.h>
 
 /** Reproduces bug in ThreadPool.
   * It get stuck if we call 'wait' many times from many other threads simultaneously.
   */
 
 
-int main(int argc, char ** argv)
+int main(int, char **)
 {
     auto worker = []
     {

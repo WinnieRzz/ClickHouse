@@ -1,9 +1,11 @@
 #include <Interpreters/InterpreterKillQueryQuery.h>
 #include <Parsers/ASTKillQueryQuery.h>
 #include <Parsers/queryToString.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/executeQuery.h>
 #include <Columns/ColumnString.h>
+#include <Common/typeid_cast.h>
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -57,15 +59,12 @@ struct QueryDescriptor
 using QueryDescriptors = std::vector<QueryDescriptor>;
 
 
-static void insertResultRow(size_t n, CancellationCode code, const Block & source_processes, Block & res)
+static void insertResultRow(size_t n, CancellationCode code, const Block & source_processes, const Block & sample_block, MutableColumns & columns)
 {
-    res.getByPosition(0).column->insert(String(cancellationCodeToStatus(code)));
+    columns[0]->insert(String(cancellationCodeToStatus(code)));
 
-    for (size_t col_num = 1; col_num < res.columns(); ++col_num)
-    {
-        ColumnWithTypeAndName & dst_col = res.getByPosition(col_num);
-        dst_col.column->insertFrom(*source_processes.getByName(dst_col.name).column, n);
-    }
+    for (size_t col_num = 1, size = columns.size(); col_num < size; ++col_num)
+        columns[col_num]->insertFrom(*source_processes.getByName(sample_block.getByPosition(col_num).name).column, n);
 }
 
 static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & processes_block, Context & context)
@@ -103,15 +102,14 @@ static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & proce
 class SyncKillQueryInputStream : public IProfilingBlockInputStream
 {
 public:
-
     SyncKillQueryInputStream(ProcessList & process_list_, QueryDescriptors && processes_to_stop_, Block && processes_block_,
                              const Block & res_sample_block_)
-    :     process_list(process_list_),
+        : process_list(process_list_),
         processes_to_stop(std::move(processes_to_stop_)),
         processes_block(std::move(processes_block_)),
         res_sample_block(res_sample_block_)
     {
-        total_rows_approx = processes_to_stop.size();
+        addTotalRowsApprox(processes_to_stop.size());
     }
 
     String getName() const override
@@ -119,10 +117,7 @@ public:
         return "SynchronousQueryKiller";
     }
 
-    String getID() const override
-    {
-        return "SynchronousQueryKiller_" + toString(intptr_t(this));
-    }
+    Block getHeader() const override { return res_sample_block; };
 
     Block readImpl() override
     {
@@ -131,7 +126,7 @@ public:
         if (num_processed_queries >= num_result_queries)
             return Block();
 
-        Block res = res_sample_block.cloneEmpty();
+        MutableColumns columns = res_sample_block.cloneEmptyColumns();
 
         do
         {
@@ -145,7 +140,7 @@ public:
                 if (code != CancellationCode::QueryIsNotInitializedYet && code != CancellationCode::CancelSent)
                 {
                     curr_process.processed = true;
-                    insertResultRow(curr_process.source_num, code, processes_block, res);
+                    insertResultRow(curr_process.source_num, code, processes_block, res_sample_block, columns);
                     ++num_processed_queries;
                 }
                 /// Wait if QueryIsNotInitializedYet or CancelSent
@@ -161,9 +156,9 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         /// Don't produce empty block
-        } while (res.rows() == 0);
+        } while (columns.empty() || columns[0]->empty());
 
-        return res;
+        return res_sample_block.cloneWithColumns(std::move(columns));
     }
 
     ProcessList & process_list;
@@ -186,25 +181,25 @@ BlockIO InterpreterKillQueryQuery::execute()
     ProcessList & process_list = context.getProcessList();
     QueryDescriptors queries_to_stop = extractQueriesExceptMeAndCheckAccess(processes_block, context);
 
-    res_io.in_sample = processes_block.cloneEmpty();
-    res_io.in_sample.insert(0, {std::make_shared<ColumnString>(), std::make_shared<DataTypeString>(), "kill_status"});
+    auto header = processes_block.cloneEmpty();
+    header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
 
     if (!query.sync || query.test)
     {
-        Block res = res_io.in_sample.cloneEmpty();
+        MutableColumns res_columns = header.cloneEmptyColumns();
 
         for (const auto & query_desc : queries_to_stop)
         {
             auto code = (query.test) ? CancellationCode::Unknown : process_list.sendCancelToQuery(query_desc.query_id, query_desc.user);
-            insertResultRow(query_desc.source_num, code, processes_block, res);
+            insertResultRow(query_desc.source_num, code, processes_block, header, res_columns);
         }
 
-        res_io.in = std::make_shared<OneBlockInputStream>(res);
+        res_io.in = std::make_shared<OneBlockInputStream>(header.cloneWithColumns(std::move(res_columns)));
     }
     else
     {
         res_io.in = std::make_shared<SyncKillQueryInputStream>(
-            process_list, std::move(queries_to_stop), std::move(processes_block), res_io.in_sample);
+            process_list, std::move(queries_to_stop), std::move(processes_block), header);
     }
 
     return res_io;

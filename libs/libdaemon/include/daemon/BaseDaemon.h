@@ -5,10 +5,11 @@
 #include <iostream>
 #include <memory>
 #include <functional>
-#include <experimental/optional>
+#include <optional>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <Poco/Process.h>
 #include <Poco/ThreadPool.h>
 #include <Poco/TaskNotification.h>
@@ -22,7 +23,7 @@
 #include <common/Types.h>
 #include <common/logger_useful.h>
 #include <daemon/GraphiteWriter.h>
-#include <Common/ConfigProcessor.h>
+#include <Common/ConfigProcessor/ConfigProcessor.h>
 
 namespace Poco { class TaskManager; }
 
@@ -54,6 +55,8 @@ class BaseDaemon : public Poco::Util::ServerApplication
     friend class SignalListener;
 
 public:
+    static constexpr char DEFAULT_GRAPHITE_CONFIG_NAME[] = "graphite";
+
     BaseDaemon();
     ~BaseDaemon();
 
@@ -67,7 +70,7 @@ public:
     void buildLoggers();
 
     /// Определяет параметр командной строки
-    void defineOptions(Poco::Util::OptionSet& _options) override;
+    void defineOptions(Poco::Util::OptionSet & _options) override;
 
     /// Заставляет демон завершаться, если хотя бы одна задача завершилась неудачно
     void exitOnTaskError();
@@ -79,7 +82,7 @@ public:
     void kill();
 
     /// Получен ли сигнал на завершение?
-    bool isCancelled()
+    bool isCancelled() const
     {
         return is_cancelled;
     }
@@ -91,7 +94,7 @@ public:
     }
 
     /// return none if daemon doesn't exist, reference to the daemon otherwise
-    static std::experimental::optional<std::reference_wrapper<BaseDaemon>> tryGetInstance() { return tryGetInstance<BaseDaemon>(); }
+    static std::optional<std::reference_wrapper<BaseDaemon>> tryGetInstance() { return tryGetInstance<BaseDaemon>(); }
 
     /// Спит заданное количество секунд или до события wakeup
     void sleep(double seconds);
@@ -107,7 +110,7 @@ public:
     /// root_path по умолчанию one_min
     /// key - лучше группировать по смыслу. Например "meminfo.cached" или "meminfo.free", "meminfo.total"
     template <class T>
-    void writeToGraphite(const std::string & key, const T & value, const std::string & config_name = "graphite", time_t timestamp = 0, const std::string & custom_root_path = "")
+    void writeToGraphite(const std::string & key, const T & value, const std::string & config_name = DEFAULT_GRAPHITE_CONFIG_NAME, time_t timestamp = 0, const std::string & custom_root_path = "")
     {
         auto writer = getGraphiteWriter(config_name);
         if (writer)
@@ -115,21 +118,29 @@ public:
     }
 
     template <class T>
-    void writeToGraphite(const GraphiteWriter::KeyValueVector<T> & key_vals, const std::string & config_name = "graphite", time_t timestamp = 0, const std::string & custom_root_path = "")
+    void writeToGraphite(const GraphiteWriter::KeyValueVector<T> & key_vals, const std::string & config_name = DEFAULT_GRAPHITE_CONFIG_NAME, time_t timestamp = 0, const std::string & custom_root_path = "")
     {
         auto writer = getGraphiteWriter(config_name);
         if (writer)
             writer->write(key_vals, timestamp, custom_root_path);
     }
 
-    GraphiteWriter * getGraphiteWriter(const std::string & config_name = "graphite")
+    template <class T>
+    void writeToGraphite(const GraphiteWriter::KeyValueVector<T> & key_vals, const std::chrono::system_clock::time_point & current_time, const std::string & custom_root_path)
+    {
+        auto writer = getGraphiteWriter();
+        if (writer)
+            writer->write(key_vals, std::chrono::system_clock::to_time_t(current_time), custom_root_path);
+    }
+
+    GraphiteWriter * getGraphiteWriter(const std::string & config_name = DEFAULT_GRAPHITE_CONFIG_NAME)
     {
         if (graphite_writers.count(config_name))
             return graphite_writers[config_name].get();
         return nullptr;
     }
 
-    std::experimental::optional<size_t> getLayer() const
+    std::optional<size_t> getLayer() const
     {
         return layer;    /// layer выставляется в классе-наследнике BaseDaemonApplication.
     }
@@ -158,7 +169,7 @@ protected:
     virtual void onInterruptSignals(int signal_id);
 
     template <class Daemon>
-    static std::experimental::optional<std::reference_wrapper<Daemon>> tryGetInstance();
+    static std::optional<std::reference_wrapper<Daemon>> tryGetInstance();
 
     virtual std::string getDefaultCorePath() const;
 
@@ -207,7 +218,7 @@ protected:
 
     std::map<std::string, std::unique_ptr<GraphiteWriter>> graphite_writers;
 
-    std::experimental::optional<size_t> layer;
+    std::optional<size_t> layer;
 
     std::mutex signal_handler_mutex;
     std::condition_variable signal_event;
@@ -216,11 +227,12 @@ protected:
 
     std::string config_path;
     ConfigProcessor::LoadedConfig loaded_config;
+    Poco::Util::AbstractConfiguration * last_configuration = nullptr;
 };
 
 
 template <class Daemon>
-std::experimental::optional<std::reference_wrapper<Daemon>> BaseDaemon::tryGetInstance()
+std::optional<std::reference_wrapper<Daemon>> BaseDaemon::tryGetInstance()
 {
     Daemon * ptr = nullptr;
     try
@@ -233,7 +245,7 @@ std::experimental::optional<std::reference_wrapper<Daemon>> BaseDaemon::tryGetIn
     }
 
     if (ptr)
-        return std::experimental::optional<std::reference_wrapper<Daemon>>(*ptr);
+        return std::optional<std::reference_wrapper<Daemon>>(*ptr);
     else
         return {};
 }

@@ -5,8 +5,9 @@
 #include <Databases/DatabaseMemory.h>
 #include <Databases/DatabasesCommon.h>
 #include <Common/escapeForFileName.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <Common/Stopwatch.h>
+#include <common/ThreadPool.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ParserCreateQuery.h>
@@ -27,7 +28,9 @@ namespace ErrorCodes
     extern const int TABLE_METADATA_DOESNT_EXIST;
     extern const int CANNOT_CREATE_TABLE_FROM_METADATA;
     extern const int INCORRECT_FILE_NAME;
+    extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
+    extern const int CANNOT_GET_CREATE_TABLE_QUERY;
 }
 
 
@@ -36,10 +39,12 @@ static constexpr size_t PRINT_MESSAGE_EACH_N_SECONDS = 5;
 static constexpr size_t METADATA_FILE_BUFFER_SIZE = 32768;
 static constexpr size_t TABLES_PARALLEL_LOAD_BUNCH_SIZE = 100;
 
-
-static String getTableMetadataPath(const String & base_path, const String & table_name)
+namespace detail
 {
-    return base_path + (endsWith(base_path, "/") ? "" : "/") + escapeForFileName(table_name) + ".sql";
+    String getTableMetadataPath(const String & base_path, const String & table_name)
+    {
+        return base_path + (endsWith(base_path, "/") ? "" : "/") + escapeForFileName(table_name) + ".sql";
+    }
 }
 
 static void loadTable(
@@ -89,14 +94,17 @@ static void loadTable(
 }
 
 
-DatabaseOrdinary::DatabaseOrdinary(
-    const String & name_, const String & path_)
-    : DatabaseMemory(name_), path(path_)
+DatabaseOrdinary::DatabaseOrdinary(const String & name_, const String & metadata_path_, const Context & context)
+    : DatabaseMemory(name_), metadata_path(metadata_path_), data_path(context.getPath() + "data/" + escapeForFileName(name_) + "/")
 {
+    Poco::File(data_path).createDirectories();
 }
 
 
-void DatabaseOrdinary::loadTables(Context & context, ThreadPool * thread_pool, bool has_force_restore_data_flag)
+void DatabaseOrdinary::loadTables(
+    Context & context,
+    ThreadPool * thread_pool,
+    bool has_force_restore_data_flag)
 {
     log = &Logger::get("DatabaseOrdinary (" + name + ")");
 
@@ -104,7 +112,7 @@ void DatabaseOrdinary::loadTables(Context & context, ThreadPool * thread_pool, b
     FileNames file_names;
 
     Poco::DirectoryIterator dir_end;
-    for (Poco::DirectoryIterator dir_it(path); dir_it != dir_end; ++dir_it)
+    for (Poco::DirectoryIterator dir_it(metadata_path); dir_it != dir_end; ++dir_it)
     {
         /// For '.svn', '.gitignore' directory and similar.
         if (dir_it.name().at(0) == '.')
@@ -126,12 +134,12 @@ void DatabaseOrdinary::loadTables(Context & context, ThreadPool * thread_pool, b
         if (endsWith(dir_it.name(), ".sql"))
             file_names.push_back(dir_it.name());
         else
-            throw Exception("Incorrect file extension: " + dir_it.name() + " in metadata directory " + path,
+            throw Exception("Incorrect file extension: " + dir_it.name() + " in metadata directory " + metadata_path,
                 ErrorCodes::INCORRECT_FILE_NAME);
     }
 
     /** Tables load faster if they are loaded in sorted (by name) order.
-      * Otherwise (for the ext4 file system), `DirectoryIterator` iterates through them in some order,
+      * Otherwise (for the ext4 filesystem), `DirectoryIterator` iterates through them in some order,
       *  which does not correspond to order tables creation and does not correspond to order of their location on disk.
       */
     std::sort(file_names.begin(), file_names.end());
@@ -139,32 +147,28 @@ void DatabaseOrdinary::loadTables(Context & context, ThreadPool * thread_pool, b
     size_t total_tables = file_names.size();
     LOG_INFO(log, "Total " << total_tables << " tables.");
 
-    String data_path = context.getPath() + "/data/" + escapeForFileName(name) + "/";
+    String data_path = context.getPath() + "data/" + escapeForFileName(name) + "/";
 
-    StopwatchWithLock watch;
+    AtomicStopwatch watch;
     std::atomic<size_t> tables_processed {0};
 
     auto task_function = [&](FileNames::const_iterator begin, FileNames::const_iterator end)
     {
-        for (FileNames::const_iterator it = begin; it != end; ++it)
+        for (auto it = begin; it != end; ++it)
         {
             const String & table = *it;
 
             /// Messages, so that it's not boring to wait for the server to load for a long time.
             if ((++tables_processed) % PRINT_MESSAGE_EACH_N_TABLES == 0
-                || watch.lockTestAndRestart(PRINT_MESSAGE_EACH_N_SECONDS))
+                || watch.compareAndRestart(PRINT_MESSAGE_EACH_N_SECONDS))
             {
                 LOG_INFO(log, std::fixed << std::setprecision(2) << tables_processed * 100.0 / total_tables << "%");
                 watch.restart();
             }
 
-            loadTable(context, path, *this, name, data_path, table, has_force_restore_data_flag);
+            loadTable(context, metadata_path, *this, name, data_path, table, has_force_restore_data_flag);
         }
     };
-
-    /** `packaged_task` is used so that exceptions are automatically passed to the main thread.
-      * Disadvantage - exceptions fall into the main thread only after the end of all tasks.
-      */
 
     const size_t bunch_size = TABLES_PARALLEL_LOAD_BUNCH_SIZE;
     size_t num_bunches = (total_tables + bunch_size - 1) / bunch_size;
@@ -186,12 +190,71 @@ void DatabaseOrdinary::loadTables(Context & context, ThreadPool * thread_pool, b
 
     if (thread_pool)
         thread_pool->wait();
+
+    /// After all tables was basically initialized, startup them.
+    startupTables(thread_pool);
+}
+
+
+void DatabaseOrdinary::startupTables(ThreadPool * thread_pool)
+{
+    LOG_INFO(log, "Starting up tables.");
+
+    AtomicStopwatch watch;
+    std::atomic<size_t> tables_processed {0};
+    size_t total_tables = tables.size();
+
+    auto task_function = [&](Tables::iterator begin, Tables::iterator end)
+    {
+        for (auto it = begin; it != end; ++it)
+        {
+            if ((++tables_processed) % PRINT_MESSAGE_EACH_N_TABLES == 0
+                || watch.compareAndRestart(PRINT_MESSAGE_EACH_N_SECONDS))
+            {
+                LOG_INFO(log, std::fixed << std::setprecision(2) << tables_processed * 100.0 / total_tables << "%");
+                watch.restart();
+            }
+
+            it->second->startup();
+        }
+    };
+
+    const size_t bunch_size = TABLES_PARALLEL_LOAD_BUNCH_SIZE;
+    size_t num_bunches = (total_tables + bunch_size - 1) / bunch_size;
+
+    auto begin = tables.begin();
+    for (size_t i = 0; i < num_bunches; ++i)
+    {
+        auto end = begin;
+
+        if (i + 1 == num_bunches)
+            end = tables.end();
+        else
+            std::advance(end, bunch_size);
+
+        auto task = std::bind(task_function, begin, end);
+
+        if (thread_pool)
+            thread_pool->schedule(task);
+        else
+            task();
+
+        begin = end;
+    }
+
+    if (thread_pool)
+        thread_pool->wait();
 }
 
 
 void DatabaseOrdinary::createTable(
-    const String & table_name, const StoragePtr & table, const ASTPtr & query, const String & engine, const Settings & settings)
+    const Context & context,
+    const String & table_name,
+    const StoragePtr & table,
+    const ASTPtr & query)
 {
+    const auto & settings = context.getSettingsRef();
+
     /// Create a file with metadata if necessary - if the query is not ATTACH.
     /// Write the query of `ATTACH table` to it.
 
@@ -206,11 +269,11 @@ void DatabaseOrdinary::createTable(
 
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (tables.count(table_name))
+        if (tables.find(table_name) != tables.end())
             throw Exception("Table " + name + "." + table_name + " already exists.", ErrorCodes::TABLE_ALREADY_EXISTS);
     }
 
-    String table_metadata_path = getTableMetadataPath(path, table_name);
+    String table_metadata_path = getTableMetadataPath(table_name);
     String table_metadata_tmp_path = table_metadata_path + ".tmp";
     String statement;
 
@@ -247,11 +310,13 @@ void DatabaseOrdinary::createTable(
 }
 
 
-void DatabaseOrdinary::removeTable(const String & table_name)
+void DatabaseOrdinary::removeTable(
+    const Context & /*context*/,
+    const String & table_name)
 {
     StoragePtr res = detachTable(table_name);
 
-    String table_metadata_path = getTableMetadataPath(path, table_name);
+    String table_metadata_path = getTableMetadataPath(table_name);
 
     try
     {
@@ -267,7 +332,7 @@ void DatabaseOrdinary::removeTable(const String & table_name)
 
 static ASTPtr getCreateQueryImpl(const String & path, const String & table_name)
 {
-    String table_metadata_path = getTableMetadataPath(path, table_name);
+    String table_metadata_path = detail::getTableMetadataPath(path, table_name);
 
     String query;
     {
@@ -281,17 +346,20 @@ static ASTPtr getCreateQueryImpl(const String & path, const String & table_name)
 
 
 void DatabaseOrdinary::renameTable(
-    const Context & context, const String & table_name, IDatabase & to_database, const String & to_table_name, const Settings & settings)
+    const Context & context,
+    const String & table_name,
+    IDatabase & to_database,
+    const String & to_table_name)
 {
     DatabaseOrdinary * to_database_concrete = typeid_cast<DatabaseOrdinary *>(&to_database);
 
     if (!to_database_concrete)
         throw Exception("Moving tables between databases of different engines is not supported", ErrorCodes::NOT_IMPLEMENTED);
 
-    StoragePtr table = tryGetTable(table_name);
+    StoragePtr table = tryGetTable(context, table_name);
 
     if (!table)
-        throw Exception("Table " + name + "." + table_name + " doesn't exist.", ErrorCodes::TABLE_ALREADY_EXISTS);
+        throw Exception("Table " + name + "." + table_name + " doesn't exist.", ErrorCodes::UNKNOWN_TABLE);
 
     /// Notify the table that it is renamed. If the table does not support renaming, exception is thrown.
     try
@@ -300,25 +368,31 @@ void DatabaseOrdinary::renameTable(
             to_database_concrete->name,
             to_table_name);
     }
+    catch (const Exception & e)
+    {
+        throw;
+    }
     catch (const Poco::Exception & e)
     {
-        /// More good diagnostics.
+        /// Better diagnostics.
         throw Exception{e};
     }
 
-    ASTPtr ast = getCreateQueryImpl(path, table_name);
+    ASTPtr ast = getCreateQueryImpl(metadata_path, table_name);
     ASTCreateQuery & ast_create_query = typeid_cast<ASTCreateQuery &>(*ast);
     ast_create_query.table = to_table_name;
 
     /// NOTE Non-atomic.
-    to_database_concrete->createTable(to_table_name, table, ast, table->getName(), settings);
-    removeTable(table_name);
+    to_database_concrete->createTable(context, to_table_name, table, ast);
+    removeTable(context, table_name);
 }
 
 
-time_t DatabaseOrdinary::getTableMetadataModificationTime(const String & table_name)
+time_t DatabaseOrdinary::getTableMetadataModificationTime(
+    const Context & /*context*/,
+    const String & table_name)
 {
-    String table_metadata_path = getTableMetadataPath(path, table_name);
+    String table_metadata_path = getTableMetadataPath(table_name);
     Poco::File meta_file(table_metadata_path);
 
     if (meta_file.exists())
@@ -332,9 +406,23 @@ time_t DatabaseOrdinary::getTableMetadataModificationTime(const String & table_n
 }
 
 
-ASTPtr DatabaseOrdinary::getCreateQuery(const String & table_name) const
+ASTPtr DatabaseOrdinary::getCreateQuery(
+    const Context & context,
+    const String & table_name) const
 {
-    ASTPtr ast = getCreateQueryImpl(path, table_name);
+    ASTPtr ast;
+    try
+    {
+        ast = getCreateQueryImpl(metadata_path, table_name);
+    }
+    catch (const Exception & e)
+    {
+        /// Handle system.* tables for which there are no table.sql files
+        if (e.code() == ErrorCodes::FILE_DOESNT_EXIST && tryGetTable(context, table_name) != nullptr)
+            throw Exception("There is no CREATE TABLE query for table " + table_name, ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY);
+
+        throw;
+    }
 
     ASTCreateQuery & ast_create_query = typeid_cast<ASTCreateQuery &>(*ast);
     ast_create_query.attach = false;
@@ -349,8 +437,16 @@ void DatabaseOrdinary::shutdown()
     /// You can not hold a lock during shutdown.
     /// Because inside `shutdown` function the tables can work with database, and mutex is not recursive.
 
-    for (auto iterator = getIterator(); iterator->isValid(); iterator->next())
-        iterator->table()->shutdown();
+    Tables tables_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        tables_snapshot = tables;
+    }
+
+    for (const auto & kv: tables_snapshot)
+    {
+        kv.second->shutdown();
+    }
 
     std::lock_guard<std::mutex> lock(mutex);
     tables.clear();
@@ -370,13 +466,13 @@ void DatabaseOrdinary::alterTable(
     const NamesAndTypesList & materialized_columns,
     const NamesAndTypesList & alias_columns,
     const ColumnDefaults & column_defaults,
-    const ASTModifier & engine_modifier)
+    const ASTModifier & storage_modifier)
 {
     /// Read the definition of the table and replace the necessary parts with new ones.
 
     String table_name_escaped = escapeForFileName(name);
-    String table_metadata_tmp_path = path + "/" + table_name_escaped + ".sql.tmp";
-    String table_metadata_path = path + "/" + table_name_escaped + ".sql";
+    String table_metadata_tmp_path = metadata_path + "/" + table_name_escaped + ".sql.tmp";
+    String table_metadata_path = metadata_path + "/" + table_name_escaped + ".sql";
     String statement;
 
     {
@@ -391,14 +487,10 @@ void DatabaseOrdinary::alterTable(
     ASTCreateQuery & ast_create_query = typeid_cast<ASTCreateQuery &>(*ast);
 
     ASTPtr new_columns = InterpreterCreateQuery::formatColumns(columns, materialized_columns, alias_columns, column_defaults);
-    auto it = std::find(ast_create_query.children.begin(), ast_create_query.children.end(), ast_create_query.columns);
-    if (it == ast_create_query.children.end())
-        throw Exception("Logical error: cannot find columns child in ASTCreateQuery", ErrorCodes::LOGICAL_ERROR);
-    *it = new_columns;
-    ast_create_query.columns = new_columns;
+    ast_create_query.replace(ast_create_query.columns, new_columns);
 
-    if (engine_modifier)
-        engine_modifier(ast_create_query.storage);
+    if (storage_modifier)
+        storage_modifier(*ast_create_query.storage);
 
     statement = getTableDefinitionFromCreateQuery(ast);
 
@@ -421,6 +513,21 @@ void DatabaseOrdinary::alterTable(
         Poco::File(table_metadata_tmp_path).remove();
         throw;
     }
+}
+
+String DatabaseOrdinary::getDataPath() const
+{
+    return data_path;
+}
+
+String DatabaseOrdinary::getMetadataPath() const
+{
+    return metadata_path;
+}
+
+String DatabaseOrdinary::getTableMetadataPath(const String & table_name) const
+{
+    return detail::getTableMetadataPath(metadata_path, table_name);
 }
 
 }

@@ -2,7 +2,8 @@
 
 #include <Dictionaries/IDictionarySource.h>
 #include <Dictionaries/DictionaryStructure.h>
-
+#include <common/LocalDateTime.h>
+#include <IO/ConnectionTimeouts.h>
 
 namespace Poco { class Logger; }
 
@@ -10,7 +11,7 @@ namespace Poco { class Logger; }
 namespace DB
 {
 
-/// Allows loading dictionaries from executable
+/// Allows loading dictionaries from http[s] source
 class HTTPDictionarySource final : public IDictionarySource
 {
 public:
@@ -27,7 +28,7 @@ public:
     BlockInputStreamPtr loadIds(const std::vector<UInt64> & ids) override;
 
     BlockInputStreamPtr loadKeys(
-        const ConstColumnPlainPtrs & key_columns, const std::vector<std::size_t> & requested_rows) override;
+        const Columns & key_columns, const std::vector<size_t> & requested_rows) override;
 
     bool isModified() const override;
 
@@ -47,6 +48,7 @@ private:
     const std::string format;
     Block sample_block;
     const Context & context;
+    ConnectionTimeouts timeouts;
 };
 
 }

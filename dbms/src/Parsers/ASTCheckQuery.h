@@ -7,9 +7,7 @@ namespace DB
 
 struct ASTCheckQuery : public ASTQueryWithOutput
 {
-    ASTCheckQuery(StringRange range_ = StringRange()) : ASTQueryWithOutput(range_) {};
-
-    /** Получить текст, который идентифицирует этот элемент. */
+    /** Get the text that identifies this element. */
     String getID() const override { return ("CheckQuery_" + database + "_" + table); };
 
     ASTPtr clone() const override
@@ -24,7 +22,7 @@ struct ASTCheckQuery : public ASTQueryWithOutput
     std::string table;
 
 protected:
-    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    void formatQueryImpl(const FormatSettings & settings, FormatState &, FormatStateStacked frame) const override
     {
         std::string nl_or_nothing = settings.one_line ? "" : "\n";
 

@@ -15,14 +15,16 @@
 #include <Parsers/ASTSubquery.h>
 #include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
-#include <Core/FieldVisitors.h>
+#include <Common/FieldVisitors.h>
 #include <DataTypes/FieldToDataType.h>
 #include <DataTypes/DataTypeTuple.h>
-#include <DataTypes/DataTypeExpression.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <AggregateFunctions/parseAggregateFunctionParameters.h>
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/IFunction.h>
+#include <Common/typeid_cast.h>
+#include <DataTypes/DataTypeFunction.h>
 
 
 namespace DB
@@ -42,7 +44,7 @@ namespace
 
 Field getValueFromConstantColumn(const ColumnPtr & column)
 {
-    if (!column->isConst())
+    if (!column->isColumnConst())
         throw Exception("Logical error: expected that column is constant", ErrorCodes::LOGICAL_ERROR);
     if (column->size() != 1)
         throw Exception("Logical error: expected that column with constant has single element", ErrorCodes::LOGICAL_ERROR);
@@ -56,10 +58,11 @@ using LambdaParameters = std::unordered_map<String, DataTypePtr>;
 
 
 void processImpl(
-    ASTPtr & ast, Context & context,
+    ASTPtr & ast, const Context & context,
     CollectAliases & aliases, const AnalyzeColumns & columns,
     TypeAndConstantInference::Info & info,
-    const AnalyzeLambdas & lambdas);
+    const AnalyzeLambdas & lambdas,
+    ExecuteTableFunctions & table_functions);
 
 
 void processLiteral(const String & column_name, const ASTPtr & ast, TypeAndConstantInference::Info & info)
@@ -76,8 +79,8 @@ void processLiteral(const String & column_name, const ASTPtr & ast, TypeAndConst
 
 
 void processIdentifier(const String & column_name, const ASTPtr & ast, TypeAndConstantInference::Info & info,
-    Context & context, CollectAliases & aliases, const AnalyzeColumns & columns,
-    const AnalyzeLambdas & lambdas)
+    const Context & context, CollectAliases & aliases, const AnalyzeColumns & columns,
+    const AnalyzeLambdas & lambdas, ExecuteTableFunctions & table_functions)
 {
     /// Column from table
     auto it = columns.columns.find(column_name);
@@ -112,7 +115,7 @@ void processIdentifier(const String & column_name, const ASTPtr & ast, TypeAndCo
             if (it->second.kind != CollectAliases::Kind::Expression)
                 throw Exception("Logical error: unexpected kind of alias", ErrorCodes::LOGICAL_ERROR);
 
-            processImpl(it->second.node, context, aliases, columns, info, lambdas);
+            processImpl(it->second.node, context, aliases, columns, info, lambdas, table_functions);
             info[column_name] = info[it->second.node->getColumnName()];
         }
     }
@@ -124,20 +127,21 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
 {
     ASTFunction * function = static_cast<ASTFunction *>(ast.get());
 
-    /// Special case for lambda functions. Lambda function has special return type "Expression".
-    /// We first create info with Expression of unspecified arguments, and will specify them later.
+    /// Special case for lambda functions. Lambda function has special return type "Function".
+    /// We first create info with Function of unspecified arguments, and will specify them later.
     if (function->name == "lambda")
     {
         size_t number_of_lambda_parameters = AnalyzeLambdas::extractLambdaParameters(function->arguments->children.at(0)).size();
 
         TypeAndConstantInference::ExpressionInfo expression_info;
         expression_info.node = ast;
-        expression_info.data_type = std::make_unique<DataTypeExpression>(DataTypes(number_of_lambda_parameters));
+        expression_info.data_type = std::make_unique<DataTypeFunction>(DataTypes(number_of_lambda_parameters));
         info.emplace(column_name, std::move(expression_info));
         return;
     }
 
     DataTypes argument_types;
+    ColumnsWithTypeAndName argument_columns;
 
     if (function->arguments)
     {
@@ -148,6 +152,9 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
                 throw Exception("Logical error: type of function argument was not inferred during depth-first search", ErrorCodes::LOGICAL_ERROR);
 
             argument_types.emplace_back(it->second.data_type);
+            argument_columns.emplace_back(ColumnWithTypeAndName(nullptr, it->second.data_type, ""));
+            if (it->second.is_constant_expression)
+                argument_columns.back().column = it->second.data_type->createColumnConst(1, it->second.value);
         }
     }
 
@@ -165,12 +172,10 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
     }
 
     /// Aggregate function.
-    if (AggregateFunctionPtr aggregate_function_ptr = AggregateFunctionFactory::instance().tryGet(function->name, argument_types))
+    Array parameters = (function->parameters) ? getAggregateFunctionParametersArray(function->parameters) : Array();
+    if (AggregateFunctionPtr aggregate_function_ptr = AggregateFunctionFactory::instance().tryGet(function->name, argument_types, parameters))
     {
-        /// NOTE Not considering aggregate function parameters in type inference. It could become needed in future.
         /// Note that aggregate function could never be constant expression.
-
-        aggregate_function_ptr->setArguments(argument_types);
 
         /// (?) Replace function name to canonical one. Because same function could be referenced by different names.
         // function->name = aggregate_function_ptr->getName();
@@ -202,7 +207,7 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
         return;
     }
 
-    const FunctionPtr & function_ptr = FunctionFactory::instance().get(function->name, context);
+    const auto & function_builder_ptr = FunctionFactory::instance().get(function->name, context);
 
     /// (?) Replace function name to canonical one. Because same function could be referenced by different names.
     // function->name = function_ptr->getName();
@@ -218,7 +223,7 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
             String child_name = child->getColumnName();
             const TypeAndConstantInference::ExpressionInfo & child_info = info.at(child_name);
             columns_for_analysis.emplace_back(
-                child_info.is_constant_expression ? child_info.data_type->createConstColumn(1, child_info.value) : nullptr,
+                child_info.is_constant_expression ? child_info.data_type->createColumnConst(1, child_info.value) : nullptr,
                 child_info.data_type,
                 child_name);
 
@@ -227,10 +232,12 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
         }
     }
 
+    auto function_ptr = function_builder_ptr->build(argument_columns);
+
     TypeAndConstantInference::ExpressionInfo expression_info;
     expression_info.node = ast;
     expression_info.function = function_ptr;
-    expression_info.data_type = function_ptr->getReturnType(argument_types);
+    expression_info.data_type = function_ptr->getReturnType();
 
     if (all_consts && function_ptr->isSuitableForConstantFolding())
     {
@@ -246,7 +253,7 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
         function_ptr->execute(block_with_constants, argument_numbers, result_position);
 
         const auto & result_column = block_with_constants.getByPosition(result_position).column;
-        if (result_column->isConst())
+        if (result_column->isColumnConst())
         {
             expression_info.is_constant_expression = true;
             expression_info.value = (*result_column)[0];
@@ -258,12 +265,12 @@ void processFunction(const String & column_name, ASTPtr & ast, TypeAndConstantIn
 
 
 void processScalarSubquery(const String & column_name, ASTPtr & ast, TypeAndConstantInference::Info & info,
-    Context & context)
+    const Context & context, ExecuteTableFunctions & table_functions)
 {
     ASTSubquery * subquery = static_cast<ASTSubquery *>(ast.get());
 
     AnalyzeResultOfQuery analyzer;
-    analyzer.process(subquery->children.at(0), context);
+    analyzer.process(subquery->children.at(0), context, table_functions);
 
     if (!analyzer.result)
         throw Exception("Logical error: no columns returned from scalar subquery", ErrorCodes::LOGICAL_ERROR);
@@ -315,15 +322,16 @@ void processScalarSubquery(const String & column_name, ASTPtr & ast, TypeAndCons
 }
 
 
-void processHigherOrderFunction(const String & column_name,
-    ASTPtr & ast, Context & context,
+void processHigherOrderFunction(
+    ASTPtr & ast, const Context & context,
     CollectAliases & aliases, const AnalyzeColumns & columns,
     TypeAndConstantInference::Info & info,
-    const AnalyzeLambdas & lambdas)
+    const AnalyzeLambdas & lambdas,
+    ExecuteTableFunctions & table_functions)
 {
     ASTFunction * function = static_cast<ASTFunction *>(ast.get());
 
-    const FunctionPtr & function_ptr = FunctionFactory::instance().get(function->name, context);
+    const auto & function_builder_ptr = FunctionFactory::instance().get(function->name, context);
 
     if (!function->arguments)
         throw Exception("Unexpected AST for higher-order function", ErrorCodes::UNEXPECTED_AST_STRUCTURE);
@@ -337,7 +345,7 @@ void processHigherOrderFunction(const String & column_name,
         types.emplace_back(child_info.data_type);
     }
 
-    function_ptr->getLambdaArgumentTypes(types);
+    function_builder_ptr->getLambdaArgumentTypes(types);
 
     /// For every lambda expression, dive into it.
 
@@ -351,12 +359,11 @@ void processHigherOrderFunction(const String & column_name,
         const ASTFunction * lambda = typeid_cast<const ASTFunction *>(child.get());
         if (lambda && lambda->name == "lambda")
         {
-            const DataTypeExpression * lambda_type = typeid_cast<const DataTypeExpression *>(types[i].get());
-            const DataTypes & lambda_argument_types = lambda_type->getArgumentTypes();
+            const auto * lambda_type = typeid_cast<const DataTypeFunction *>(types[i].get());
 
             if (!lambda_type)
                 throw Exception("Logical error: IFunction::getLambdaArgumentTypes returned data type for lambda expression,"
-                    " that is not DataTypeExpression", ErrorCodes::LOGICAL_ERROR);
+                    " that is not DataTypeFunction", ErrorCodes::LOGICAL_ERROR);
 
             if (!lambda->arguments || lambda->arguments->children.size() != 2)
                 throw Exception("Lambda function must have exactly two arguments (sides of arrow)", ErrorCodes::BAD_LAMBDA);
@@ -364,6 +371,8 @@ void processHigherOrderFunction(const String & column_name,
             /// Set types for every lambda parameter.
 
             AnalyzeLambdas::LambdaParameters parameters = AnalyzeLambdas::extractLambdaParameters(lambda->arguments->children[0]);
+
+            const DataTypes & lambda_argument_types = lambda_type->getArgumentTypes();
 
             if (parameters.size() != lambda_argument_types.size())
                 throw Exception("DataTypeExpression for lambda function has different number of argument types than number of lambda parameters",
@@ -383,11 +392,11 @@ void processHigherOrderFunction(const String & column_name,
 
             /// Now dive into.
 
-            processImpl(lambda->arguments->children[1], context, aliases, columns, info, lambdas);
+            processImpl(lambda->arguments->children[1], context, aliases, columns, info, lambdas, table_functions);
 
             /// Update Expression type (expression signature).
 
-            info.at(lambda->getColumnName()).data_type = std::make_shared<DataTypeExpression>(
+            info.at(lambda->getColumnName()).data_type = std::make_shared<DataTypeFunction>(
                 lambda_argument_types, info.at(lambda->arguments->children[1]->getColumnName()).data_type);
         }
     }
@@ -395,10 +404,11 @@ void processHigherOrderFunction(const String & column_name,
 
 
 void processImpl(
-    ASTPtr & ast, Context & context,
+    ASTPtr & ast, const Context & context,
     CollectAliases & aliases, const AnalyzeColumns & columns,
     TypeAndConstantInference::Info & info,
-    const AnalyzeLambdas & lambdas)
+    const AnalyzeLambdas & lambdas,
+    ExecuteTableFunctions & table_functions)
 {
     const ASTFunction * function = typeid_cast<const ASTFunction *>(ast.get());
 
@@ -428,7 +438,7 @@ void processImpl(
             if (function && function->name == "lambda")
                 continue;
 
-            processImpl(child, context, aliases, columns, info, lambdas);
+            processImpl(child, context, aliases, columns, info, lambdas, table_functions);
         }
     }
 
@@ -453,25 +463,28 @@ void processImpl(
     {
         /// If this is higher-order function, determine types of lambda arguments and infer types of subexpressions inside lambdas.
         if (lambdas.higher_order_functions.end() != std::find(lambdas.higher_order_functions.begin(), lambdas.higher_order_functions.end(), ast))
-            processHigherOrderFunction(column_name, ast, context, aliases, columns, info, lambdas);
+            processHigherOrderFunction(ast, context, aliases, columns, info, lambdas, table_functions);
 
         processFunction(column_name, ast, info, context);
     }
     else if (literal)
         processLiteral(column_name, ast, info);
     else if (identifier)
-        processIdentifier(column_name, ast, info, context, aliases, columns, lambdas);
+        processIdentifier(column_name, ast, info, context, aliases, columns, lambdas, table_functions);
     else if (subquery)
-        processScalarSubquery(column_name, ast, info, context);
+        processScalarSubquery(column_name, ast, info, context, table_functions);
 }
 
 }
 
 
-void TypeAndConstantInference::process(ASTPtr & ast, Context & context,
-    CollectAliases & aliases, const AnalyzeColumns & columns, const AnalyzeLambdas & lambdas)
+void TypeAndConstantInference::process(ASTPtr & ast, const Context & context,
+    CollectAliases & aliases,
+    const AnalyzeColumns & columns,
+    const AnalyzeLambdas & lambdas,
+    ExecuteTableFunctions & table_functions)
 {
-    processImpl(ast, context, aliases, columns, info, lambdas);
+    processImpl(ast, context, aliases, columns, info, lambdas, table_functions);
 }
 
 
@@ -504,7 +517,7 @@ void TypeAndConstantInference::dump(WriteBuffer & out) const
         else
         {
             std::stringstream formatted_ast;
-            formatAST(*it->second.node, formatted_ast, 0, false, true);
+            formatAST(*it->second.node, formatted_ast, false, true);
             writeString(formatted_ast.str(), out);
         }
 

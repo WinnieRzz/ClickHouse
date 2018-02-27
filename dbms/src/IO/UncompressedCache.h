@@ -2,9 +2,9 @@
 
 #include <Common/LRUCache.h>
 #include <Common/SipHash.h>
+#include <Common/UInt128.h>
 #include <Common/ProfileEvents.h>
 #include <IO/BufferWithOwnMemory.h>
-#include <Interpreters/AggregationCommon.h>
 
 
 namespace ProfileEvents
@@ -52,7 +52,7 @@ public:
         SipHash hash;
         hash.update(path_to_file.data(), path_to_file.size() + 1);
         hash.update(reinterpret_cast<const char *>(&offset), sizeof(offset));
-        hash.get128(key.first, key.second);
+        hash.get128(key.low, key.high);
 
         return key;
     }
@@ -69,7 +69,7 @@ public:
         return res;
     }
 
-    void set(const Key & key, MappedPtr mapped)
+    void set(const Key & key, const MappedPtr & mapped)
     {
         Base::set(key, mapped);
         ProfileEvents::increment(ProfileEvents::UncompressedCacheWeightLost, current_weight_lost);

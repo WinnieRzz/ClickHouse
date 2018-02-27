@@ -20,7 +20,7 @@ namespace DB
   * `sizeof` is equal to the size of one pointer.
   *
   * Not exception-safe.
-  * Copying is not supported. Moving empties the original object.
+  * Copying is supported via assign() method. Moving empties the original object.
   * That is, it is inconvenient to use this array in many cases.
   *
   * Designed for situations in which many arrays of the same small size are created,
@@ -36,8 +36,6 @@ namespace DB
 
 const size_t empty_auto_array_helper = 0;
 
-struct DontInitElemsTag {};
-
 template <typename T>
 class AutoArray
 {
@@ -48,18 +46,9 @@ public:
         setEmpty();
     }
 
-    AutoArray(size_t size_)
+    explicit AutoArray(size_t size_)
     {
         init(size_, false);
-    }
-
-    /** The default constructors for elements will not be called.
-      * In this case, you must insert all elements using the `place` and `placement new` functions,
-      *  since destructors are then called for them.
-      */
-    AutoArray(size_t size_, const DontInitElemsTag & tag)
-    {
-        init(size_, true);
     }
 
     /** Initializes all elements with a copy constructor with the `value` parameter.
@@ -123,6 +112,24 @@ public:
     {
         uninit();
         setEmpty();
+    }
+
+    template <typename It>
+    void assign(It from_begin, It from_end)
+    {
+        uninit();
+
+        size_t size = from_end - from_begin;
+        init(size, /* dont_init_elems = */ true);
+
+        It it = from_begin;
+        for (size_t i = 0; i < size; ++i, ++it)
+            new (place(i)) T(*it);
+    }
+
+    void assign(const AutoArray & from)
+    {
+        assign(from.begin(), from.end());
     }
 
     /** You can read and modify elements using the [] operator

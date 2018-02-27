@@ -38,12 +38,60 @@ size_t countBytesInFilter(const IColumn::Filter & filt)
             | (static_cast<UInt64>(_mm_movemask_epi8(_mm_cmpgt_epi8(
                 _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos + 48)),
                 zero16))) << 48));
+
+    /// TODO Add duff device for tail?
 #endif
 
     for (; pos < end; ++pos)
         count += *pos > 0;
 
     return count;
+}
+
+std::vector<size_t> countColumnsSizeInSelector(IColumn::ColumnIndex num_columns, const IColumn::Selector & selector)
+{
+    std::vector<size_t> counts(num_columns);
+    for (auto idx : selector)
+        ++counts[idx];
+
+    return counts;
+}
+
+/** clang 4 generates better code than gcc 6.
+  * And both gcc and clang could not vectorize trivial loop by bytes automatically.
+  */
+bool memoryIsZero(const void * data, size_t size)
+{
+    const Int8 * pos = reinterpret_cast<const Int8 *>(data);
+    const Int8 * end = pos + size;
+
+#if __SSE2__
+    const __m128 zero16 = _mm_setzero_ps();
+    const Int8 * end64 = pos + size / 64 * 64;
+
+    for (; pos < end64; pos += 64)
+        if (_mm_movemask_ps(_mm_cmpneq_ps(
+                _mm_loadu_ps(reinterpret_cast<const float *>(pos)),
+                zero16))
+            | _mm_movemask_ps(_mm_cmpneq_ps(
+                _mm_loadu_ps(reinterpret_cast<const float *>(pos + 16)),
+                zero16))
+            | _mm_movemask_ps(_mm_cmpneq_ps(
+                _mm_loadu_ps(reinterpret_cast<const float *>(pos + 32)),
+                zero16))
+            | _mm_movemask_ps(_mm_cmpneq_ps(
+                _mm_loadu_ps(reinterpret_cast<const float *>(pos + 48)),
+                zero16)))
+            return false;
+
+    /// TODO Add duff device for tail?
+#endif
+
+    for (; pos < end; ++pos)
+        if (*pos)
+            return false;
+
+    return true;
 }
 
 
@@ -60,10 +108,10 @@ namespace
 
     struct ResultOffsetsBuilder
     {
-        IColumn::Offsets_t & res_offsets;
-        IColumn::Offset_t current_src_offset = 0;
+        IColumn::Offsets & res_offsets;
+        IColumn::Offset current_src_offset = 0;
 
-        ResultOffsetsBuilder(IColumn::Offsets_t * res_offsets_) : res_offsets(*res_offsets_) {}
+        explicit ResultOffsetsBuilder(IColumn::Offsets * res_offsets_) : res_offsets(*res_offsets_) {}
 
         void reserve(ssize_t result_size_hint, size_t src_size)
         {
@@ -78,14 +126,14 @@ namespace
 
         template <size_t SIMD_BYTES>
         void insertChunk(
-            const IColumn::Offset_t * src_offsets_pos,
+            const IColumn::Offset * src_offsets_pos,
             bool first,
-            IColumn::Offset_t chunk_offset,
+            IColumn::Offset chunk_offset,
             size_t chunk_size)
         {
             const auto offsets_size_old = res_offsets.size();
             res_offsets.resize(offsets_size_old + SIMD_BYTES);
-            memcpy(&res_offsets[offsets_size_old], src_offsets_pos, SIMD_BYTES * sizeof(IColumn::Offset_t));
+            memcpy(&res_offsets[offsets_size_old], src_offsets_pos, SIMD_BYTES * sizeof(IColumn::Offset));
 
             if (!first)
             {
@@ -107,16 +155,16 @@ namespace
 
     struct NoResultOffsetsBuilder
     {
-        NoResultOffsetsBuilder(IColumn::Offsets_t * res_offsets_) {}
-        void reserve(ssize_t result_size_hint, size_t src_size) {}
-        void insertOne(size_t array_size) {}
+        explicit NoResultOffsetsBuilder(IColumn::Offsets *) {}
+        void reserve(ssize_t, size_t) {}
+        void insertOne(size_t) {}
 
         template <size_t SIMD_BYTES>
         void insertChunk(
-            const IColumn::Offset_t * src_offsets_pos,
-            bool first,
-            IColumn::Offset_t chunk_offset,
-            size_t chunk_size)
+            const IColumn::Offset *,
+            bool,
+            IColumn::Offset,
+            size_t)
         {
         }
     };
@@ -124,8 +172,8 @@ namespace
 
     template <typename T, typename ResultOffsetsBuilder>
     void filterArraysImplGeneric(
-        const PaddedPODArray<T> & src_elems, const IColumn::Offsets_t & src_offsets,
-        PaddedPODArray<T> & res_elems, IColumn::Offsets_t * res_offsets,
+        const PaddedPODArray<T> & src_elems, const IColumn::Offsets & src_offsets,
+        PaddedPODArray<T> & res_elems, IColumn::Offsets * res_offsets,
         const IColumn::Filter & filt, ssize_t result_size_hint)
     {
         const size_t size = src_offsets.size();
@@ -151,7 +199,7 @@ namespace
         const auto offsets_begin = offsets_pos;
 
         /// copy array ending at *end_offset_ptr
-        const auto copy_array = [&] (const IColumn::Offset_t * offset_ptr)
+        const auto copy_array = [&] (const IColumn::Offset * offset_ptr)
         {
             const auto offset = offset_ptr == offsets_begin ? 0 : offset_ptr[-1];
             const auto size = *offset_ptr - offset;
@@ -219,8 +267,8 @@ namespace
 
 template <typename T>
 void filterArraysImpl(
-    const PaddedPODArray<T> & src_elems, const IColumn::Offsets_t & src_offsets,
-    PaddedPODArray<T> & res_elems, IColumn::Offsets_t & res_offsets,
+    const PaddedPODArray<T> & src_elems, const IColumn::Offsets & src_offsets,
+    PaddedPODArray<T> & res_elems, IColumn::Offsets & res_offsets,
     const IColumn::Filter & filt, ssize_t result_size_hint)
 {
     return filterArraysImplGeneric<T, ResultOffsetsBuilder>(src_elems, src_offsets, res_elems, &res_offsets, filt, result_size_hint);
@@ -228,7 +276,7 @@ void filterArraysImpl(
 
 template <typename T>
 void filterArraysImplOnlyData(
-    const PaddedPODArray<T> & src_elems, const IColumn::Offsets_t & src_offsets,
+    const PaddedPODArray<T> & src_elems, const IColumn::Offsets & src_offsets,
     PaddedPODArray<T> & res_elems,
     const IColumn::Filter & filt, ssize_t result_size_hint)
 {
@@ -239,11 +287,11 @@ void filterArraysImplOnlyData(
 /// Explicit instantiations - not to place the implementation of the function above in the header file.
 #define INSTANTIATE(TYPE) \
 template void filterArraysImpl<TYPE>( \
-    const PaddedPODArray<TYPE> &, const IColumn::Offsets_t &, \
-    PaddedPODArray<TYPE> &, IColumn::Offsets_t &, \
+    const PaddedPODArray<TYPE> &, const IColumn::Offsets &, \
+    PaddedPODArray<TYPE> &, IColumn::Offsets &, \
     const IColumn::Filter &, ssize_t); \
 template void filterArraysImplOnlyData<TYPE>( \
-    const PaddedPODArray<TYPE> &, const IColumn::Offsets_t &, \
+    const PaddedPODArray<TYPE> &, const IColumn::Offsets &, \
     PaddedPODArray<TYPE> &, \
     const IColumn::Filter &, ssize_t);
 

@@ -32,15 +32,10 @@ public:
 
     String getName() const override { return "MongoDB"; }
 
-    String getID() const override;
+    Block getHeader() const override { return description.sample_block; };
 
 private:
     Block readImpl() override;
-
-    static void insertDefaultValue(IColumn * column, const IColumn & sample_column)
-    {
-        column->insertFrom(sample_column, 0);
-    }
 
     std::shared_ptr<Poco::MongoDB::Connection> connection;
     std::unique_ptr<Poco::MongoDB::Cursor> cursor;

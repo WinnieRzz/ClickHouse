@@ -52,9 +52,6 @@ struct Test
             {
                 DB::WriteBufferFromFile wb(filename);
                 wb.write(reinterpret_cast<const char *>(&store), sizeof(store));
-                const unsigned char * p = reinterpret_cast<const unsigned char *>(&store);
-                for (size_t i = 0; i < sizeof(store); ++i)
-                    ++p;
             }
 
             {
@@ -229,7 +226,7 @@ struct TestSet
 
 struct Generator1
 {
-    static UInt8 execute(size_t i, size_t width)
+    static UInt8 execute(size_t, size_t width)
     {
         return (1 << width) - 1;
     }

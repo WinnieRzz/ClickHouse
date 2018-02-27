@@ -1,15 +1,21 @@
 #include "MetricsTransmitter.h"
 
-#include <Poco/Util/Application.h>
-#include <Poco/Util/LayeredConfiguration.h>
-#include <daemon/BaseDaemon.h>
+#include <Interpreters/AsynchronousMetrics.h>
+#include <Interpreters/Context.h>
+
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
 #include <Common/setThreadName.h>
-#include <Interpreters/AsynchronousMetrics.h>
+
+#include <daemon/BaseDaemon.h>
+
+#include <Poco/Util/Application.h>
+#include <Poco/Util/LayeredConfiguration.h>
+
 
 namespace DB
 {
+
 MetricsTransmitter::~MetricsTransmitter()
 {
     try
@@ -32,13 +38,14 @@ MetricsTransmitter::~MetricsTransmitter()
 
 void MetricsTransmitter::run()
 {
-    auto & config = Poco::Util::Application::instance().config();
+    const auto & config = context.getConfigRef();
     auto interval = config.getInt(config_name + ".interval", 60);
 
     const std::string thread_name = "MericsTrns " + std::to_string(interval) + "s";
     setThreadName(thread_name.c_str());
 
-    const auto get_next_time = [](size_t seconds) {
+    const auto get_next_time = [](size_t seconds)
+    {
         /// To avoid time drift and transmit values exactly each interval:
         ///  next time aligned to system seconds
         /// (60s -> every minute at 00 seconds, 5s -> every minute:[00, 05, 15 ... 55]s, 3600 -> every hour:00:00
@@ -63,7 +70,7 @@ void MetricsTransmitter::run()
 
 void MetricsTransmitter::transmit(std::vector<ProfileEvents::Count> & prev_counters)
 {
-    auto & config = Poco::Util::Application::instance().config();
+    const auto & config = context.getConfigRef();
     auto async_metrics_values = async_metrics.getValues();
 
     GraphiteWriter::KeyValueVector<ssize_t> key_vals{};

@@ -1,9 +1,9 @@
 #include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromString.h>
 #include <IO/Operators.h>
 
 #include <DataStreams/TabSeparatedRowInputStream.h>
 #include <DataStreams/verbosePrintString.h>
-#include <DataTypes/DataTypesNumber.h>
 
 
 namespace DB
@@ -12,22 +12,23 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INCORRECT_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 
-TabSeparatedRowInputStream::TabSeparatedRowInputStream(ReadBuffer & istr_, const Block & sample_, bool with_names_, bool with_types_)
-    : istr(istr_), sample(sample_), with_names(with_names_), with_types(with_types_)
+TabSeparatedRowInputStream::TabSeparatedRowInputStream(ReadBuffer & istr_, const Block & header_, bool with_names_, bool with_types_)
+    : istr(istr_), header(header_), with_names(with_names_), with_types(with_types_)
 {
-    size_t columns = sample.columns();
-    data_types.resize(columns);
-    for (size_t i = 0; i < columns; ++i)
-        data_types[i] = sample.safeGetByPosition(i).type;
+    size_t num_columns = header.columns();
+    data_types.resize(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+        data_types[i] = header.safeGetByPosition(i).type;
 }
 
 
 void TabSeparatedRowInputStream::readPrefix()
 {
-    size_t columns = sample.columns();
+    size_t num_columns = header.columns();
     String tmp;
 
     if (with_names || with_types)
@@ -40,25 +41,25 @@ void TabSeparatedRowInputStream::readPrefix()
 
     if (with_names)
     {
-        for (size_t i = 0; i < columns; ++i)
+        for (size_t i = 0; i < num_columns; ++i)
         {
             readEscapedString(tmp, istr);
-            assertChar(i == columns - 1 ? '\n' : '\t', istr);
+            assertChar(i == num_columns - 1 ? '\n' : '\t', istr);
         }
     }
 
     if (with_types)
     {
-        for (size_t i = 0; i < columns; ++i)
+        for (size_t i = 0; i < num_columns; ++i)
         {
             readEscapedString(tmp, istr);
-            assertChar(i == columns - 1 ? '\n' : '\t', istr);
+            assertChar(i == num_columns - 1 ? '\n' : '\t', istr);
         }
     }
 }
 
 
- /** Check for a common error case - usage of Windows line feed.
+/** Check for a common error case - usage of Windows line feed.
   */
 static void checkForCarriageReturn(ReadBuffer & istr)
 {
@@ -71,18 +72,18 @@ static void checkForCarriageReturn(ReadBuffer & istr)
 }
 
 
-bool TabSeparatedRowInputStream::read(Block & block)
+bool TabSeparatedRowInputStream::read(MutableColumns & columns)
 {
+    if (istr.eof())
+        return false;
+
     updateDiagnosticInfo();
 
     size_t size = data_types.size();
 
-    if (istr.eof())
-        return false;
-
     for (size_t i = 0; i < size; ++i)
     {
-        data_types[i].get()->deserializeTextEscaped(*block.getByPosition(i).column.get(), istr);
+        data_types[i]->deserializeTextEscaped(*columns[i], istr);
 
         /// skip separators
         if (i + 1 == size)
@@ -108,27 +109,26 @@ String TabSeparatedRowInputStream::getDiagnosticInfo()
     if (istr.eof())        /// Buffer has gone, cannot extract information about what has been parsed.
         return {};
 
-    String res;
-    WriteBufferFromString out(res);
-    Block block = sample.cloneEmpty();
+    WriteBufferFromOwnString out;
+    MutableColumns columns = header.cloneEmptyColumns();
 
     /// It is possible to display detailed diagnostics only if the last and next to last lines are still in the read buffer.
     size_t bytes_read_at_start_of_buffer = istr.count() - istr.offset();
     if (bytes_read_at_start_of_buffer != bytes_read_at_start_of_buffer_on_prev_row)
     {
         out << "Could not print diagnostic info because two last rows aren't in buffer (rare case)\n";
-        return res;
+        return out.str();
     }
 
     size_t max_length_of_column_name = 0;
-    for (size_t i = 0; i < sample.columns(); ++i)
-        if (sample.safeGetByPosition(i).name.size() > max_length_of_column_name)
-            max_length_of_column_name = sample.safeGetByPosition(i).name.size();
+    for (size_t i = 0; i < header.columns(); ++i)
+        if (header.safeGetByPosition(i).name.size() > max_length_of_column_name)
+            max_length_of_column_name = header.safeGetByPosition(i).name.size();
 
     size_t max_length_of_data_type_name = 0;
-    for (size_t i = 0; i < sample.columns(); ++i)
-        if (sample.safeGetByPosition(i).type->getName().size() > max_length_of_data_type_name)
-            max_length_of_data_type_name = sample.safeGetByPosition(i).type->getName().size();
+    for (size_t i = 0; i < header.columns(); ++i)
+        if (header.safeGetByPosition(i).type->getName().size() > max_length_of_data_type_name)
+            max_length_of_data_type_name = header.safeGetByPosition(i).type->getName().size();
 
     /// Roll back the cursor to the beginning of the previous or current line and pars all over again. But now we derive detailed information.
 
@@ -137,29 +137,29 @@ String TabSeparatedRowInputStream::getDiagnosticInfo()
         istr.position() = pos_of_prev_row;
 
         out << "\nRow " << (row_num - 1) << ":\n";
-        if (!parseRowAndPrintDiagnosticInfo(block, out, max_length_of_column_name, max_length_of_data_type_name))
-            return res;
+        if (!parseRowAndPrintDiagnosticInfo(columns, out, max_length_of_column_name, max_length_of_data_type_name))
+            return out.str();
     }
     else
     {
         if (!pos_of_current_row)
         {
             out << "Could not print diagnostic info because parsing of data hasn't started.\n";
-            return res;
+            return out.str();
         }
 
         istr.position() = pos_of_current_row;
     }
 
     out << "\nRow " << row_num << ":\n";
-    parseRowAndPrintDiagnosticInfo(block, out, max_length_of_column_name, max_length_of_data_type_name);
+    parseRowAndPrintDiagnosticInfo(columns, out, max_length_of_column_name, max_length_of_data_type_name);
     out << "\n";
 
-    return res;
+    return out.str();
 }
 
 
-bool TabSeparatedRowInputStream::parseRowAndPrintDiagnosticInfo(Block & block,
+bool TabSeparatedRowInputStream::parseRowAndPrintDiagnosticInfo(MutableColumns & columns,
     WriteBuffer & out, size_t max_length_of_column_name, size_t max_length_of_data_type_name)
 {
     size_t size = data_types.size();
@@ -172,7 +172,7 @@ bool TabSeparatedRowInputStream::parseRowAndPrintDiagnosticInfo(Block & block,
         }
 
         out << "Column " << i << ", " << std::string((i < 10 ? 2 : i < 100 ? 1 : 0), ' ')
-            << "name: " << sample.safeGetByPosition(i).name << ", " << std::string(max_length_of_column_name - sample.safeGetByPosition(i).name.size(), ' ')
+            << "name: " << header.safeGetByPosition(i).name << ", " << std::string(max_length_of_column_name - header.safeGetByPosition(i).name.size(), ' ')
             << "type: " << data_types[i]->getName() << ", " << std::string(max_length_of_data_type_name - data_types[i]->getName().size(), ' ');
 
         auto prev_position = istr.position();
@@ -180,7 +180,7 @@ bool TabSeparatedRowInputStream::parseRowAndPrintDiagnosticInfo(Block & block,
 
         try
         {
-            data_types[i]->deserializeTextEscaped(*block.safeGetByPosition(i).column, istr);
+            data_types[i]->deserializeTextEscaped(*columns[i], istr);
         }
         catch (...)
         {
@@ -192,9 +192,9 @@ bool TabSeparatedRowInputStream::parseRowAndPrintDiagnosticInfo(Block & block,
         if (curr_position < prev_position)
             throw Exception("Logical error: parsing is non-deterministic.", ErrorCodes::LOGICAL_ERROR);
 
-        if (data_types[i]->isNumeric())
+        if (data_types[i]->isNumber() || data_types[i]->isDateOrDateTime())
         {
-            /// An empty string instead of a number.
+            /// An empty string instead of a value.
             if (curr_position == prev_position)
             {
                 out << "ERROR: text ";
@@ -220,7 +220,7 @@ bool TabSeparatedRowInputStream::parseRowAndPrintDiagnosticInfo(Block & block,
 
         out << "\n";
 
-        if (data_types[i]->isNumeric())
+        if (data_types[i]->haveMaximumSizeOfValue())
         {
             if (*curr_position != '\n' && *curr_position != '\t')
             {
@@ -306,15 +306,17 @@ void TabSeparatedRowInputStream::syncAfterError()
 {
     skipToUnescapedNextLineOrEOF(istr);
 }
+
+
 void TabSeparatedRowInputStream::updateDiagnosticInfo()
-    {
-        ++row_num;
+{
+    ++row_num;
 
-        bytes_read_at_start_of_buffer_on_prev_row = bytes_read_at_start_of_buffer_on_current_row;
-        bytes_read_at_start_of_buffer_on_current_row = istr.count() - istr.offset();
+    bytes_read_at_start_of_buffer_on_prev_row = bytes_read_at_start_of_buffer_on_current_row;
+    bytes_read_at_start_of_buffer_on_current_row = istr.count() - istr.offset();
 
-        pos_of_prev_row = pos_of_current_row;
-        pos_of_current_row = istr.position();
-    }
+    pos_of_prev_row = pos_of_current_row;
+    pos_of_current_row = istr.position();
+}
 
 }

@@ -1,9 +1,10 @@
-#include <ext/range.hpp>
+#include <ext/range.h>
 #include <Dictionaries/ExternalResultDescription.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -60,7 +61,15 @@ void ExternalResultDescription::init(const Block & sample_block_)
                 ErrorCodes::UNKNOWN_TYPE};
 
         names.emplace_back(column.name);
-        sample_columns.emplace_back(column.column.get());
+        sample_columns.emplace_back(column.column);
+
+        /// If default value for column was not provided, use default from data type.
+        if (sample_columns.back()->empty())
+        {
+            MutableColumnPtr mutable_column = sample_columns.back()->mutate();
+            column.type->insertDefaultInto(*mutable_column);
+            sample_columns.back() = std::move(mutable_column);
+        }
     }
 }
 

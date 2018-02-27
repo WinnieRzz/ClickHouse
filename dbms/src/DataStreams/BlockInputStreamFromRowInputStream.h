@@ -18,7 +18,7 @@ class BlockInputStreamFromRowInputStream : public IProfilingBlockInputStream
 public:
     /** sample_ - block with zero rows, that structure describes how to interpret values */
     BlockInputStreamFromRowInputStream(
-        RowInputStreamPtr row_input_,
+        const RowInputStreamPtr & row_input_,
         const Block & sample_,
         size_t max_block_size_,
         UInt64 allow_errors_num_,
@@ -29,21 +29,16 @@ public:
 
     String getName() const override { return "BlockInputStreamFromRowInputStream"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << this;
-        return res.str();
-    }
-
     RowInputStreamPtr & getRowInput() { return row_input; }
+
+    Block getHeader() const override { return sample; }
 
 protected:
     Block readImpl() override;
 
 private:
     RowInputStreamPtr row_input;
-    const Block sample;
+    Block sample;
     size_t max_block_size;
 
     UInt64 allow_errors_num;

@@ -2,7 +2,6 @@
 
 #include <Core/Types.h>
 
-#include <map>
 #include <vector>
 #include <unordered_set>
 #include <memory>
@@ -38,7 +37,7 @@ public:
 class AddressPatterns
 {
 private:
-    using Container = std::vector<std::unique_ptr<IAddressPattern>>;
+    using Container = std::vector<std::shared_ptr<IAddressPattern>>;
     Container patterns;
 
 public:
@@ -67,26 +66,6 @@ struct User
     DatabaseSet databases;
 
     User(const String & name_, const String & config_elem, Poco::Util::AbstractConfiguration & config);
-
-    /// For insertion to containers.
-    User() {}
-};
-
-
-/// Known users.
-class Users
-{
-private:
-    using Container = std::map<String, User>;
-    Container cont;
-
-public:
-    void loadFromConfig(Poco::Util::AbstractConfiguration & config);
-
-    const User & get(const String & name, const String & password, const Poco::Net::IPAddress & address) const;
-
-    /// Check if the user has access to the database.
-    bool isAllowedDatabase(const std::string & user_name, const std::string & database_name) const;
 };
 
 

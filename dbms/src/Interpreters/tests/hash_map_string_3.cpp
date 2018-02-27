@@ -14,7 +14,7 @@
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/CompressedReadBuffer.h>
-#include <Core/StringRef.h>
+#include <common/StringRef.h>
 #include <Common/HashTable/HashMap.h>
 #include <Interpreters/AggregationCommon.h>
 
@@ -29,7 +29,7 @@ for file in MobilePhoneModel PageCharset Params URLDomain UTMSource Referer URL 
   echo
   BEST_METHOD=0
   BEST_RESULT=0
-  for method in {1..10}; do
+  for method in {1..11}; do
    echo -ne $file $size $method '';
    TOTAL_ELEMS=0
    for i in {0..1000}; do
@@ -68,7 +68,7 @@ struct DefaultHash<STRUCT> \
 { \
     size_t operator() (STRUCT x) const \
     { \
-        return CityHash64(x.data, x.size); \
+        return CityHash_v1_0_2::CityHash64(x.data, x.size);  \
     } \
 };
 
@@ -88,7 +88,7 @@ inline bool operator==(StringRef_CompareMemcmp lhs, StringRef_CompareMemcmp rhs)
     return 0 == memcmp(lhs.data, rhs.data, lhs.size);
 }
 
-inline bool operator==(StringRef_CompareAlwaysTrue lhs, StringRef_CompareAlwaysTrue rhs)
+inline bool operator==(StringRef_CompareAlwaysTrue, StringRef_CompareAlwaysTrue)
 {
     return true;
 }
@@ -113,7 +113,8 @@ struct FastHash64
         uint64_t h = len * m;
         uint64_t v;
 
-        while (pos != end) {
+        while (pos != end)
+        {
             v = *pos++;
             h ^= mix(v);
             h *= m;
@@ -122,19 +123,40 @@ struct FastHash64
         pos2 = reinterpret_cast<const unsigned char*>(pos);
         v = 0;
 
-        switch (len & 7) {
-        case 7: v ^= static_cast<uint64_t>(pos2[6]) << 48;
-        case 6: v ^= static_cast<uint64_t>(pos2[5]) << 40;
-        case 5: v ^= static_cast<uint64_t>(pos2[4]) << 32;
-        case 4: v ^= static_cast<uint64_t>(pos2[3]) << 24;
-        case 3: v ^= static_cast<uint64_t>(pos2[2]) << 16;
-        case 2: v ^= static_cast<uint64_t>(pos2[1]) << 8;
-        case 1: v ^= static_cast<uint64_t>(pos2[0]);
-            h ^= mix(v);
-            h *= m;
+        switch (len & 7)
+        {
+            case 7: v ^= static_cast<uint64_t>(pos2[6]) << 48; [[fallthrough]];
+            case 6: v ^= static_cast<uint64_t>(pos2[5]) << 40; [[fallthrough]];
+            case 5: v ^= static_cast<uint64_t>(pos2[4]) << 32; [[fallthrough]];
+            case 4: v ^= static_cast<uint64_t>(pos2[3]) << 24; [[fallthrough]];
+            case 3: v ^= static_cast<uint64_t>(pos2[2]) << 16; [[fallthrough]];
+            case 2: v ^= static_cast<uint64_t>(pos2[1]) << 8; [[fallthrough]];
+            case 1: v ^= static_cast<uint64_t>(pos2[0]);
+                h ^= mix(v);
+                h *= m;
         }
 
         return mix(h);
+    }
+};
+
+
+struct FNV1a
+{
+    size_t operator() (StringRef x) const
+    {
+        size_t res = 0xcbf29ce484222325ULL;
+
+        const char * pos = x.data;
+        const char * end = x.data + x.size;
+
+        for (; pos < end; ++pos)
+        {
+            res *= 1099511628211ULL;
+            res ^= *pos;
+        }
+
+        return res;
     }
 };
 
@@ -304,7 +326,8 @@ struct MetroHash64
 {
     size_t operator() (StringRef x) const
     {
-        union {
+        union
+        {
             uint64_t u64;
             std::uint8_t u8[sizeof(u64)];
         };
@@ -434,6 +457,12 @@ void NO_INLINE bench(const std::vector<StringRef> & data, const char * name)
 
 int main(int argc, char ** argv)
 {
+    if (argc < 3)
+    {
+        std::cerr << "Usage: program n m\n";
+        return 1;
+    }
+
     size_t n = atoi(argv[1]);
     size_t m = atoi(argv[2]);
 
@@ -462,20 +491,21 @@ int main(int argc, char ** argv)
             << std::endl;
     }
 
-    if (!m || m == 1) bench<StringRef_CompareMemcmp, StringRefHash64>(data, "StringRef_CityHash64");
-    if (!m || m == 2) bench<StringRef_CompareMemcmp, FastHash64>    (data, "StringRef_FastHash64");
-    if (!m || m == 3) bench<StringRef_CompareMemcmp, SimpleHash>    (data, "StringRef_SimpleHash");
+    if (!m || m == 1) bench<StringRef, StringRefHash64>(data, "StringRef_CityHash64");
+    if (!m || m == 2) bench<StringRef, FastHash64>     (data, "StringRef_FastHash64");
+    if (!m || m == 3) bench<StringRef, SimpleHash>     (data, "StringRef_SimpleHash");
+    if (!m || m == 4) bench<StringRef, FNV1a>          (data, "StringRef_FNV1a");
 
 #if __SSE4_1__
-    if (!m || m == 4) bench<StringRef_CompareMemcmp, CrapWow>        (data, "StringRef_CrapWow");
-    if (!m || m == 5) bench<StringRef_CompareMemcmp, CRC32Hash>        (data, "StringRef_CRC32Hash");
-    if (!m || m == 6) bench<StringRef_CompareMemcmp, CRC32ILPHash>    (data, "StringRef_CRC32ILPHash");
+    if (!m || m == 5) bench<StringRef, CrapWow>        (data, "StringRef_CrapWow");
+    if (!m || m == 6) bench<StringRef, CRC32Hash>      (data, "StringRef_CRC32Hash");
+    if (!m || m == 7) bench<StringRef, CRC32ILPHash>   (data, "StringRef_CRC32ILPHash");
 #endif
 
-    if (!m || m == 7) bench<StringRef_CompareMemcmp, VerySimpleHash>(data, "StringRef_VerySimpleHash");
-    if (!m || m == 8) bench<StringRef_CompareMemcmp, FarmHash64>(data, "StringRef_FarmHash64");
-    if (!m || m == 9) bench<StringRef_CompareMemcmp, MetroHash64<metrohash64_1>>(data, "StringRef_MetroHash64_1");
-    if (!m || m == 10) bench<StringRef_CompareMemcmp, MetroHash64<metrohash64_2>>(data, "StringRef_MetroHash64_2");
+    if (!m || m == 8) bench<StringRef, VerySimpleHash> (data, "StringRef_VerySimpleHash");
+    if (!m || m == 9) bench<StringRef, FarmHash64>     (data, "StringRef_FarmHash64");
+    if (!m || m == 10) bench<StringRef, MetroHash64<metrohash64_1>>(data, "StringRef_MetroHash64_1");
+    if (!m || m == 11) bench<StringRef, MetroHash64<metrohash64_2>>(data, "StringRef_MetroHash64_2");
 
     return 0;
 }

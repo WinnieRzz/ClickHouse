@@ -37,31 +37,30 @@ try
 
     formatAST(*ast, std::cerr);
     std::cerr << std::endl;
-    std::cerr << ast->getTreeID() << std::endl;
 
-    Context context;
+    Context context = Context::createGlobal();
 
     ExpressionAnalyzer analyzer(ast, context, {}, {NameAndTypePair("number", std::make_shared<DataTypeUInt64>())});
     ExpressionActionsChain chain;
     analyzer.appendSelect(chain, false);
-    analyzer.appendProjectResult(chain, false);
+    analyzer.appendProjectResult(chain);
     chain.finalize();
     ExpressionActionsPtr expression = chain.getLastActions();
 
-    StoragePtr table = StorageSystemNumbers::create("Numbers");
+    StoragePtr table = StorageSystemNumbers::create("numbers", false);
 
     Names column_names;
     column_names.push_back("number");
 
     QueryProcessingStage::Enum stage;
 
-    BlockInputStreamPtr in = table->read(column_names, 0, context, Settings(), stage)[0];
+    BlockInputStreamPtr in = table->read(column_names, {}, context, stage, 8192, 1)[0];
     in = std::make_shared<FilterBlockInputStream>(in, expression, 1);
     in = std::make_shared<LimitBlockInputStream>(in, 10, std::max(static_cast<Int64>(0), static_cast<Int64>(n) - 10));
 
     WriteBufferFromOStream ob(std::cout);
     RowOutputStreamPtr out_ = std::make_shared<TabSeparatedRowOutputStream>(ob, expression->getSampleBlock());
-    BlockOutputStreamFromRowOutputStream out(out_);
+    BlockOutputStreamFromRowOutputStream out(out_, expression->getSampleBlock());
 
 
     {

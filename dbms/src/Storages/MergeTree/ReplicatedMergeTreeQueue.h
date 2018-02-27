@@ -1,8 +1,10 @@
+#pragma once
+
 #include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <Storages/MergeTree/ActiveDataPartSet.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 
-#include <zkutil/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
 
 
 namespace DB
@@ -28,14 +30,16 @@ private:
     {
         bool operator()(const LogEntryPtr & lhs, const LogEntryPtr & rhs) const
         {
-            return std::forward_as_tuple(lhs.get()->create_time, lhs.get())
-                 < std::forward_as_tuple(rhs.get()->create_time, rhs.get());
+            return std::forward_as_tuple(lhs->create_time, lhs.get())
+                 < std::forward_as_tuple(rhs->create_time, rhs.get());
         }
     };
 
     /// To calculate min_unprocessed_insert_time, max_processed_insert_time, for which the replica lag is calculated.
     using InsertsByTime = std::set<LogEntryPtr, ByTime>;
 
+
+    MergeTreeDataFormatVersion format_version;
 
     String zookeeper_path;
     String replica_path;
@@ -45,6 +49,10 @@ private:
       * In ZK records in chronological order. Here it is not necessary.
       */
     Queue queue;
+
+    /// If true, the queue in RAM is possibly out of sync with ZK and we need to reload it.
+    /// Protected by pull_logs_to_queue_mutex.
+    bool is_dirty = false;
 
     InsertsByTime inserts_by_time;
     time_t min_unprocessed_insert_time = 0;
@@ -77,7 +85,7 @@ private:
     void initVirtualParts(const MergeTreeData::DataParts & parts);
 
     /// Load (initialize) a queue from ZooKeeper (/replicas/me/queue/).
-    void load(zkutil::ZooKeeperPtr zookeeper);
+    bool load(zkutil::ZooKeeperPtr zookeeper);
 
     void insertUnlocked(LogEntryPtr & entry);
 
@@ -121,12 +129,16 @@ private:
     };
 
 public:
-    ReplicatedMergeTreeQueue() {}
+    ReplicatedMergeTreeQueue(MergeTreeDataFormatVersion format_version_)
+        : format_version(format_version_)
+        , virtual_parts(format_version)
+    {
+    }
 
     void initialize(const String & zookeeper_path_, const String & replica_path_, const String & logger_name_,
         const MergeTreeData::DataParts & parts, zkutil::ZooKeeperPtr zookeeper);
 
-    /** Paste action to the end of the queue.
+    /** Inserts an action to the end of the queue.
       * To restore broken parts during operation.
       * Do not insert the action itself into ZK (do it yourself).
       */
@@ -147,6 +159,17 @@ public:
       * And also wait for the completion of their execution, if they are now being executed.
       */
     void removeGetsAndMergesInRange(zkutil::ZooKeeperPtr zookeeper, const String & part_name);
+
+    /** Disables future merges and fetches inside entry.new_part_name
+     *  If there are currently executing merges or fetches then throws exception.
+     */
+    void disableMergesAndFetchesInRange(const LogEntry & entry);
+
+    /** Returns list of currently executing entries blocking execution of specified CLEAR_COLUMN command
+     * Call it under mutex
+     */
+    Queue getConflictsForClearColumnCommand(const LogEntry & entry, String * out_conflicts_description);
+
 
     /** In the case where there are not enough parts to perform the merge in part_name
       * - move actions with merged parts to the end of the queue

@@ -5,6 +5,7 @@
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -101,20 +102,18 @@ StoragePtr tryGetTable(const ASTPtr & database_and_table, const Context & contex
 
 void replaceDatabaseAndTable(ASTPtr & database_and_table, const String & database_name, const String & table_name)
 {
-    ASTPtr table = std::make_shared<ASTIdentifier>(StringRange(), table_name, ASTIdentifier::Table);
+    ASTPtr table = std::make_shared<ASTIdentifier>(table_name, ASTIdentifier::Table);
 
     if (!database_name.empty())
     {
-        ASTPtr database = std::make_shared<ASTIdentifier>(StringRange(), database_name, ASTIdentifier::Database);
+        ASTPtr database = std::make_shared<ASTIdentifier>(database_name, ASTIdentifier::Database);
 
-        database_and_table = std::make_shared<ASTIdentifier>(
-            StringRange(), database_name + "." + table_name, ASTIdentifier::Table);
+        database_and_table = std::make_shared<ASTIdentifier>(database_name + "." + table_name, ASTIdentifier::Table);
         database_and_table->children = {database, table};
     }
     else
     {
-        database_and_table = std::make_shared<ASTIdentifier>(
-            StringRange(), table_name, ASTIdentifier::Table);
+        database_and_table = std::make_shared<ASTIdentifier>(table_name, ASTIdentifier::Table);
     }
 }
 
@@ -209,10 +208,7 @@ void InJoinSubqueriesPreprocessor::process(ASTSelectQuery * query) const
 
 bool InJoinSubqueriesPreprocessor::hasAtLeastTwoShards(const IStorage & table) const
 {
-    if (!table.isRemote())
-        return false;
-
-    const StorageDistributed * distributed = typeid_cast<const StorageDistributed *>(&table);
+    const StorageDistributed * distributed = dynamic_cast<const StorageDistributed *>(&table);
     if (!distributed)
         return false;
 
@@ -223,7 +219,7 @@ bool InJoinSubqueriesPreprocessor::hasAtLeastTwoShards(const IStorage & table) c
 std::pair<std::string, std::string>
 InJoinSubqueriesPreprocessor::getRemoteDatabaseAndTableName(const IStorage & table) const
 {
-    const StorageDistributed & distributed = typeid_cast<const StorageDistributed &>(table);
+    const StorageDistributed & distributed = dynamic_cast<const StorageDistributed &>(table);
     return { distributed.getRemoteDatabaseName(), distributed.getRemoteTableName() };
 }
 

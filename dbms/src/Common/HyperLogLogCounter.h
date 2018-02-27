@@ -36,7 +36,7 @@ namespace details
 {
 
 /// Look-up table of logarithms for integer numbers, used in HyperLogLogCounter.
-template<UInt8 K>
+template <UInt8 K>
 struct LogLUT
 {
     LogLUT()
@@ -60,25 +60,25 @@ private:
     double log_table[M + 1];
 };
 
-template<UInt8 K> struct MinCounterTypeHelper;
-template<> struct MinCounterTypeHelper<0>    { using Type = UInt8; };
-template<> struct MinCounterTypeHelper<1>    { using Type = UInt16; };
-template<> struct MinCounterTypeHelper<2>    { using Type = UInt32; };
-template<> struct MinCounterTypeHelper<3>    { using Type = UInt64; };
+template <UInt8 K> struct MinCounterTypeHelper;
+template <> struct MinCounterTypeHelper<0>    { using Type = UInt8; };
+template <> struct MinCounterTypeHelper<1>    { using Type = UInt16; };
+template <> struct MinCounterTypeHelper<2>    { using Type = UInt32; };
+template <> struct MinCounterTypeHelper<3>    { using Type = UInt64; };
 
 /// Auxiliary structure for automatic determining minimum size of counter's type depending on its maximum value.
 /// Used in HyperLogLogCounter in order to spend memory efficiently.
-template<UInt64 MaxValue> struct MinCounterType
+template <UInt64 MaxValue> struct MinCounterType
 {
-    typedef typename MinCounterTypeHelper<
+    using Type = typename MinCounterTypeHelper<
         (MaxValue >= 1 << 8) +
         (MaxValue >= 1 << 16) +
         (MaxValue >= 1ULL << 32)
-        >::Type Type;
+        >::Type;
 };
 
 /// Denominator of expression for HyperLogLog algorithm.
-template<UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
+template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
     DenominatorMode denominator_mode, typename Enable = void>
 class __attribute__ ((packed)) Denominator;
 
@@ -98,7 +98,7 @@ template <typename HashValueType, typename DenominatorType, DenominatorMode deno
 struct IntermediateDenominator;
 
 template <typename DenominatorType, DenominatorMode denominator_mode>
-struct IntermediateDenominator<UInt32, DenominatorType, denominator_mode, typename std::enable_if<denominator_mode != DenominatorMode::ExactType>::type>
+struct IntermediateDenominator<UInt32, DenominatorType, denominator_mode, std::enable_if_t<denominator_mode != DenominatorMode::ExactType>>
 {
     using Type = double;
 };
@@ -118,11 +118,11 @@ struct IntermediateDenominator<HashValueType, DenominatorType, DenominatorMode::
 /// "Lightweight" implementation of expression's denominator for HyperLogLog algorithm.
 /// Uses minimum amount of memory, but estimates may be unstable.
 /// Satisfiable when rank storage is small enough.
-template<UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
+template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
     DenominatorMode denominator_mode>
 class __attribute__ ((packed)) Denominator<precision, max_rank, HashValueType, DenominatorType,
     denominator_mode,
-    typename std::enable_if<!details::isBigRankStore(precision) || !(denominator_mode == DenominatorMode::StableIfBig)>::type>
+    std::enable_if_t<!details::isBigRankStore(precision) || !(denominator_mode == DenominatorMode::StableIfBig)>>
 {
 private:
     using T = typename IntermediateDenominator<HashValueType, DenominatorType, denominator_mode>::Type;
@@ -162,11 +162,11 @@ private:
 /// Fully-functional version of expression's denominator for HyperLogLog algorithm.
 /// Spends more space that lightweight version. Estimates will always be stable.
 /// Used when rank storage is big.
-template<UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
+template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
     DenominatorMode denominator_mode>
 class __attribute__ ((packed)) Denominator<precision, max_rank, HashValueType, DenominatorType,
     denominator_mode,
-    typename std::enable_if<details::isBigRankStore(precision) && denominator_mode == DenominatorMode::StableIfBig>::type>
+    std::enable_if_t<details::isBigRankStore(precision) && denominator_mode == DenominatorMode::StableIfBig>>
 {
 public:
     Denominator(DenominatorType initial_value)
@@ -305,11 +305,11 @@ public:
         update(bucket, rank);
     }
 
-    UInt32 size() const
+    UInt64 size() const
     {
         /// Normalizing factor for harmonic mean.
         static constexpr double alpha_m =
-            bucket_count == 2     ? 0.351 :
+            bucket_count == 2  ? 0.351 :
             bucket_count == 4  ? 0.532 :
             bucket_count == 8  ? 0.626 :
             bucket_count == 16 ? 0.673 :
@@ -323,7 +323,7 @@ public:
 
         double final_estimate = fixRawEstimate(raw_estimate);
 
-        return static_cast<UInt32>(final_estimate + 0.5);
+        return static_cast<UInt64>(final_estimate + 0.5);
     }
 
     void merge(const HyperLogLogCounter & rhs)
@@ -443,13 +443,12 @@ private:
             return applyBiasCorrection(raw_estimate);
         else if (mode == HyperLogLogMode::FullFeatured)
         {
-            static constexpr bool fix_big_cardinalities = std::is_same<HashValueType, UInt32>::value;
             static constexpr double pow2_32 = 4294967296.0;
 
             double fixed_estimate;
 
-            if (fix_big_cardinalities && (raw_estimate > (pow2_32 / 30.0)))
-                fixed_estimate = -pow2_32 * log(1.0 - raw_estimate / pow2_32);
+            if (raw_estimate > (pow2_32 / 30.0))
+                fixed_estimate = raw_estimate;
             else
                 fixed_estimate = applyCorrection(raw_estimate);
 
@@ -516,10 +515,8 @@ private:
     }
 
 private:
-    /// Maximum rank.
     static constexpr int max_rank = sizeof(HashValueType) * 8 - precision + 1;
 
-    /// Rank storage.
     RankStore rank_store;
 
     /// Expression's denominator for HyperLogLog algorithm.

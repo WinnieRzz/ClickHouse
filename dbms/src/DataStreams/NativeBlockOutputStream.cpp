@@ -5,26 +5,24 @@
 #include <IO/VarInt.h>
 #include <IO/CompressedWriteBuffer.h>
 
-#include <Columns/ColumnConst.h>
-#include <Columns/ColumnArray.h>
-#include <Columns/ColumnNullable.h>
-#include <Columns/ColumnsNumber.h>
-
-#include <DataTypes/DataTypeArray.h>
-#include <DataTypes/DataTypeNullable.h>
-#include <DataTypes/DataTypesNumber.h>
-
 #include <DataStreams/MarkInCompressedFile.h>
 #include <DataStreams/NativeBlockOutputStream.h>
 
+#include <Common/typeid_cast.h>
 
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+
 NativeBlockOutputStream::NativeBlockOutputStream(
-    WriteBuffer & ostr_, UInt64 client_revision_,
+    WriteBuffer & ostr_, UInt64 client_revision_, const Block & header_,
     WriteBuffer * index_ostr_, size_t initial_size_of_file_)
-    : ostr(ostr_), client_revision(client_revision_),
+    : ostr(ostr_), client_revision(client_revision_), header(header_),
     index_ostr(index_ostr_), initial_size_of_file(initial_size_of_file_)
 {
     if (index_ostr)
@@ -49,78 +47,23 @@ void NativeBlockOutputStream::writeData(const IDataType & type, const ColumnPtr 
       */
     ColumnPtr full_column;
 
-    if (auto converted = column->convertToFullColumnIfConst())
+    if (ColumnPtr converted = column->convertToFullColumnIfConst())
         full_column = converted;
     else
         full_column = column;
 
-    if (type.isNullable())
-    {
-        const DataTypeNullable & nullable_type = static_cast<const DataTypeNullable &>(type);
-        const IDataType & nested_type = *nullable_type.getNestedType();
-
-        const ColumnNullable & nullable_col = static_cast<const ColumnNullable &>(*full_column.get());
-        const ColumnPtr & nested_col = nullable_col.getNestedColumn();
-
-        const IColumn & null_map = nullable_col.getNullMapConcreteColumn();
-        DataTypeUInt8{}.serializeBinaryBulk(null_map, ostr, offset, limit);
-
-        writeData(nested_type, nested_col, ostr, offset, limit);
-    }
-    else if (const DataTypeArray * type_arr = typeid_cast<const DataTypeArray *>(&type))
-    {
-        /** For arrays, you first need to serialize the offsets, and then the values.
-          */
-        const ColumnArray & column_array = typeid_cast<const ColumnArray &>(*full_column);
-        type_arr->getOffsetsType()->serializeBinaryBulk(*column_array.getOffsetsColumn(), ostr, offset, limit);
-
-        if (!typeid_cast<const ColumnArray &>(*full_column).getData().empty())
-        {
-            const ColumnArray::Offsets_t & offsets = column_array.getOffsets();
-
-            if (offset > offsets.size())
-                return;
-
-            /** offset - from which array to write.
-              * limit - how many arrays should be written, or 0, if you write everything that is.
-              * end - up to which array written part finishes.
-              *
-              * nested_offset - from which nested element to write.
-              * nested_limit - how many nested elements to write, or 0, if you write everything that is.
-              */
-
-            size_t end = std::min(offset + limit, offsets.size());
-
-            size_t nested_offset = offset ? offsets[offset - 1] : 0;
-            size_t nested_limit = limit
-                ? offsets[end - 1] - nested_offset
-                : 0;
-
-            const DataTypePtr & nested_type = type_arr->getNestedType();
-
-            DataTypePtr actual_type;
-            if (nested_type->isNull())
-            {
-                /// Special case: an array of Null is actually an array of Nullable(UInt8).
-                actual_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>());
-            }
-            else
-                actual_type = nested_type;
-
-            if (limit == 0 || nested_limit)
-                writeData(*actual_type, typeid_cast<const ColumnArray &>(*full_column).getDataPtr(), ostr, nested_offset, nested_limit);
-        }
-    }
-    else
-        type.serializeBinaryBulk(*full_column, ostr, offset, limit);
+    IDataType::OutputStreamGetter output_stream_getter = [&] (const IDataType::SubstreamPath &) { return &ostr; };
+    type.serializeBinaryBulkWithMultipleStreams(*full_column, output_stream_getter, offset, limit, false, {});
 }
 
 
 void NativeBlockOutputStream::write(const Block & block)
 {
     /// Additional information about the block.
-    if (client_revision >= DBMS_MIN_REVISION_WITH_BLOCK_INFO)
+    if (client_revision > 0)
         block.info.write(ostr);
+
+    block.checkNumberOfRows();
 
     /// Dimensions
     size_t columns = block.columns();
@@ -156,7 +99,15 @@ void NativeBlockOutputStream::write(const Block & block)
         writeStringBinary(column.name, ostr);
 
         /// Type
-        writeStringBinary(column.type->getName(), ostr);
+        String type_name = column.type->getName();
+
+        /// For compatibility, we will not send explicit timezone parameter in DateTime data type
+        ///  to older clients, that cannot understand it.
+        if (client_revision < DBMS_MIN_REVISION_WITH_TIME_ZONE_PARAMETER_IN_DATETIME_DATA_TYPE
+            && startsWith(type_name, "DateTime("))
+            type_name = "DateTime";
+
+        writeStringBinary(type_name, ostr);
 
         /// Data
         if (rows)    /// Zero items of data is always represented as zero number of bytes.

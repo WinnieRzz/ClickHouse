@@ -5,7 +5,7 @@
 #include <Poco/NumberParser.h>
 #include <common/JSON.h>
 #include <common/find_first_symbols.h>
-#include <common/exp10.h>
+#include <common/preciseExp10.h>
 
 #include <iostream>
 
@@ -147,7 +147,7 @@ static double readFloatText(const char * buf, const char * end)
             {
                 ++buf;
                 Int32 exponent = readIntText(buf, end);
-                x *= exp10(exponent);
+                x *= preciseExp10(exponent);
 
                 run = false;
                 break;
@@ -456,7 +456,7 @@ JSON JSON::operator[] (size_t n) const
         ++it, ++i;
 
     if (i != n)
-        throw JSONException("JSON: array index " + Poco::NumberFormatter::format(n) + " out of bounds.");
+        throw JSONException("JSON: array index " + Poco::NumberFormatter::format(Poco::UInt64(n)) + " out of bounds.");
 
     return *it;
 }

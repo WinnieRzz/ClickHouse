@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/copyData.h>
+#include <IO/ConnectionTimeouts.h>
 
 
 namespace DB
@@ -28,7 +29,6 @@ public:
 
 private:
     MergeTreeData::DataPartPtr findPart(const String & name);
-    MergeTreeData::DataPartPtr findShardedPart(const String & name, size_t shard_no);
 
 private:
     MergeTreeData & data;
@@ -52,30 +52,14 @@ public:
         const String & replica_path,
         const String & host,
         int port,
+        const ConnectionTimeouts & timeouts,
         bool to_detached = false);
 
-    /// Method for resharding. Downloads a sharded part
-    /// from the specified shard to the `to_detached` folder.
-    MergeTreeData::MutableDataPartPtr fetchShardedPart(
-        const InterserverIOEndpointLocation & location,
-        const String & part_name,
-        size_t shard_no);
-
-    void cancel() { is_cancelled = true; }
-
-private:
-    MergeTreeData::MutableDataPartPtr fetchPartImpl(
-        const String & part_name,
-        const String & replica_path,
-        const String & host,
-        int port,
-        const String & shard_no,
-        bool to_detached);
+    /// You need to stop the data transfer.
+    ActionBlocker blocker;
 
 private:
     MergeTreeData & data;
-    /// You need to stop the data transfer.
-    std::atomic<bool> is_cancelled {false};
     Logger * log;
 };
 

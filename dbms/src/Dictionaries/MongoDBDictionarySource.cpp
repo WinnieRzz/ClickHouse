@@ -1,11 +1,16 @@
 #include <Common/config.h>
 #if Poco_MongoDB_FOUND
 #include <Poco/Util/AbstractConfiguration.h>
-#include <Poco/MD5Engine.h>
-#include <Poco/MongoDB/Connection.h>
-#include <Poco/MongoDB/Database.h>
-#include <Poco/MongoDB/Cursor.h>
-#include <Poco/MongoDB/Array.h>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+    #include <Poco/MongoDB/Connection.h>
+    #include <Poco/MongoDB/Database.h>
+    #include <Poco/MongoDB/Cursor.h>
+    #include <Poco/MongoDB/Array.h>
+    #include <Poco/MongoDB/ObjectId.h>
+#pragma GCC diagnostic pop
+
 #include <Poco/Version.h>
 
 // only after poco
@@ -14,8 +19,8 @@
 // dbms/src/IO/WriteHelpers.h:146 #define writeCString(s, buf)
 #include <Dictionaries/MongoDBDictionarySource.h>
 #include <Dictionaries/MongoDBBlockInputStream.h>
-#include <Core/FieldVisitors.h>
-#include <ext/enumerate.hpp>
+#include <Common/FieldVisitors.h>
+#include <ext/enumerate.h>
 
 
 namespace DB
@@ -183,7 +188,7 @@ static std::unique_ptr<Poco::MongoDB::Cursor> createCursor(
     if (!sample_block_to_select.has("_id"))
         cursor->query().returnFieldSelector().add("_id", 0);
 
-    for (const auto & column : sample_block_to_select.getColumns())
+    for (const auto & column : sample_block_to_select)
         cursor->query().returnFieldSelector().add(column.name, 1);
 
     return cursor;
@@ -212,7 +217,7 @@ BlockInputStreamPtr MongoDBDictionarySource::loadIds(const std::vector<UInt64> &
     for (const UInt64 id : ids)
         ids_array->add(DB::toString(id), Int32(id));
 
-    cursor->query().selector().addNewDocument(dict_struct.id.value().name)
+    cursor->query().selector().addNewDocument(dict_struct.id->name)
         .add("$in", ids_array);
 
     return std::make_shared<MongoDBBlockInputStream>(
@@ -221,7 +226,7 @@ BlockInputStreamPtr MongoDBDictionarySource::loadIds(const std::vector<UInt64> &
 
 
 BlockInputStreamPtr MongoDBDictionarySource::loadKeys(
-    const ConstColumnPlainPtrs & key_columns, const std::vector<std::size_t> & requested_rows)
+    const Columns & key_columns, const std::vector<size_t> & requested_rows)
 {
     if (!dict_struct.key)
         throw Exception{"'key' is required for selective loading", ErrorCodes::UNSUPPORTED_METHOD};
@@ -229,6 +234,7 @@ BlockInputStreamPtr MongoDBDictionarySource::loadKeys(
     auto cursor = createCursor(db, collection, sample_block);
 
     Poco::MongoDB::Array::Ptr keys_array(new Poco::MongoDB::Array);
+
     for (const auto row_idx : requested_rows)
     {
         auto & key = keys_array->addNewDocument(DB::toString(row_idx));
@@ -241,6 +247,7 @@ BlockInputStreamPtr MongoDBDictionarySource::loadKeys(
                 case AttributeUnderlyingType::UInt16:
                 case AttributeUnderlyingType::UInt32:
                 case AttributeUnderlyingType::UInt64:
+                case AttributeUnderlyingType::UInt128:
                 case AttributeUnderlyingType::Int8:
                 case AttributeUnderlyingType::Int16:
                 case AttributeUnderlyingType::Int32:
@@ -254,12 +261,23 @@ BlockInputStreamPtr MongoDBDictionarySource::loadKeys(
                     break;
 
                 case AttributeUnderlyingType::String:
-                    key.add(attr.second.name, get<String>((*key_columns[attr.first])[row_idx]));
+                    String _str(get<String>((*key_columns[attr.first])[row_idx]));
+                    /// Convert string to ObjectID
+                    if (attr.second.is_object_id)
+                    {
+                        Poco::MongoDB::ObjectId::Ptr _id(new Poco::MongoDB::ObjectId(_str));
+                        key.add(attr.second.name, _id);
+                    }
+                    else
+                    {
+                        key.add(attr.second.name, _str);
+                    }
                     break;
             }
         }
     }
 
+    /// If more than one key we should use $or
     cursor->query().selector().add("$or", keys_array);
 
     return std::make_shared<MongoDBBlockInputStream>(

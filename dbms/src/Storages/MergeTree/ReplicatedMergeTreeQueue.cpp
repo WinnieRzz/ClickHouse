@@ -1,8 +1,9 @@
+#include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
-#include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
+#include <Storages/MergeTree/MergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeDataMerger.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
 
 
 namespace DB
@@ -11,6 +12,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int UNEXPECTED_NODE_IN_ZOOKEEPER;
+    extern const int UNFINISHED;
 }
 
 
@@ -23,36 +25,60 @@ void ReplicatedMergeTreeQueue::initVirtualParts(const MergeTreeData::DataParts &
 }
 
 
-void ReplicatedMergeTreeQueue::load(zkutil::ZooKeeperPtr zookeeper)
+bool ReplicatedMergeTreeQueue::load(zkutil::ZooKeeperPtr zookeeper)
 {
     auto queue_path = replica_path + "/queue";
     LOG_DEBUG(log, "Loading queue from " << queue_path);
 
-    std::lock_guard<std::mutex> lock(mutex);
-
-    Strings children = zookeeper->getChildren(queue_path);
-    LOG_DEBUG(log, "Having " << children.size() << " queue entries to load.");
-
-    std::sort(children.begin(), children.end());
-
-    std::vector<std::pair<String, zkutil::ZooKeeper::GetFuture>> futures;
-    futures.reserve(children.size());
-
-    for (const String & child : children)
-        futures.emplace_back(child, zookeeper->asyncGet(queue_path + "/" + child));
-
-    for (auto & future : futures)
+    bool updated = false;
+    bool min_unprocessed_insert_time_changed = false;
     {
-        zkutil::ZooKeeper::ValueAndStat res = future.second.get();
-        LogEntryPtr entry = LogEntry::parse(res.value, res.stat);
+        std::lock_guard<std::mutex> lock(mutex);
 
-        entry->znode_name = future.first;
-        insertUnlocked(entry);
+        std::unordered_set<String> already_loaded_paths;
+        for (const LogEntryPtr & log_entry : queue)
+            already_loaded_paths.insert(log_entry->znode_name);
+
+        Strings children = zookeeper->getChildren(queue_path);
+        auto to_remove_it = std::remove_if(
+            children.begin(), children.end(), [&](const String & path)
+            {
+                return already_loaded_paths.count(path);
+            });
+
+        LOG_DEBUG(log,
+            "Having " << (to_remove_it - children.begin()) << " queue entries to load, "
+            << (children.end() - to_remove_it) << " entries already loaded.");
+        children.erase(to_remove_it, children.end());
+
+        std::sort(children.begin(), children.end());
+
+        std::vector<std::pair<String, zkutil::ZooKeeper::GetFuture>> futures;
+        futures.reserve(children.size());
+
+        for (const String & child : children)
+            futures.emplace_back(child, zookeeper->asyncGet(queue_path + "/" + child));
+
+        for (auto & future : futures)
+        {
+            zkutil::ZooKeeper::ValueAndStat res = future.second.get();
+            LogEntryPtr entry = LogEntry::parse(res.value, res.stat);
+            entry->znode_name = future.first;
+
+            time_t prev_min_unprocessed_insert_time = min_unprocessed_insert_time;
+
+            insertUnlocked(entry);
+
+            updated = true;
+            if (min_unprocessed_insert_time != prev_min_unprocessed_insert_time)
+                min_unprocessed_insert_time_changed = true;
+        }
     }
 
-    updateTimesInZooKeeper(zookeeper, true, false);
+    updateTimesInZooKeeper(zookeeper, min_unprocessed_insert_time_changed, false);
 
     LOG_TRACE(log, "Loaded queue");
+    return updated;
 }
 
 
@@ -232,6 +258,13 @@ bool ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::ZooKeeperPtr zookeeper, z
 {
     std::lock_guard<std::mutex> lock(pull_logs_to_queue_mutex);
 
+    bool dirty_entries_loaded = false;
+    if (is_dirty)
+    {
+        dirty_entries_loaded = load(zookeeper);
+        is_dirty = false;
+    }
+
     String index_str = zookeeper->get(replica_path + "/log_pointer");
     UInt64 index;
 
@@ -309,6 +342,7 @@ bool ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::ZooKeeperPtr zookeeper, z
                 const auto & entry = *copied_entries.back();
                 if (entry.type == LogEntry::GET_PART)
                 {
+                    std::lock_guard<std::mutex> lock(mutex);
                     if (entry.create_time && (!min_unprocessed_insert_time || entry.create_time < min_unprocessed_insert_time))
                     {
                         min_unprocessed_insert_time = entry.create_time;
@@ -324,7 +358,20 @@ bool ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::ZooKeeperPtr zookeeper, z
                 ops.emplace_back(std::make_unique<zkutil::Op::SetData>(
                     replica_path + "/min_unprocessed_insert_time", toString(min_unprocessed_insert_time), -1));
 
-            auto results = zookeeper->multi(ops);
+            try
+            {
+                zookeeper->multi(ops);
+            }
+            catch (const zkutil::KeeperException & ex)
+            {
+                if (ex.isTemporaryError())
+                {
+                    LOG_WARNING(log, "Unknown status of queue update, marking queue dirty (will reload on next iteration).");
+                    is_dirty = true;
+                }
+
+                throw;
+            }
 
             /// Now we have successfully updated the queue in ZooKeeper. Update it in RAM.
 
@@ -340,7 +387,7 @@ bool ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::ZooKeeperPtr zookeeper, z
                     insertUnlocked(copied_entries[i]);
                 }
 
-                last_queue_update = time(0);
+                last_queue_update = time(nullptr);
             }
             catch (...)
             {
@@ -360,7 +407,7 @@ bool ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::ZooKeeperPtr zookeeper, z
             next_update_event->set();
     }
 
-    return !log_entries.empty();
+    return dirty_entries_loaded || !log_entries.empty();
 }
 
 
@@ -420,7 +467,7 @@ void ReplicatedMergeTreeQueue::removeGetsAndMergesInRange(zkutil::ZooKeeperPtr z
     for (Queue::iterator it = queue.begin(); it != queue.end();)
     {
         if (((*it)->type == LogEntry::GET_PART || (*it)->type == LogEntry::MERGE_PARTS) &&
-            ActiveDataPartSet::contains(part_name, (*it)->new_part_name))
+            MergeTreePartInfo::contains(part_name, (*it)->new_part_name, format_version))
         {
             if ((*it)->currently_executing)
                 to_wait.push_back(*it);
@@ -448,6 +495,60 @@ void ReplicatedMergeTreeQueue::removeGetsAndMergesInRange(zkutil::ZooKeeperPtr z
 }
 
 
+ReplicatedMergeTreeQueue::Queue ReplicatedMergeTreeQueue::getConflictsForClearColumnCommand(
+    const LogEntry & entry, String * out_conflicts_description)
+{
+    Queue conflicts;
+
+    for (auto & elem : queue)
+    {
+        if (elem->currently_executing && elem->znode_name != entry.znode_name)
+        {
+            if (elem->type == LogEntry::MERGE_PARTS || elem->type == LogEntry::GET_PART || elem->type == LogEntry::ATTACH_PART)
+            {
+                if (MergeTreePartInfo::contains(entry.new_part_name, elem->new_part_name, format_version))
+                    conflicts.emplace_back(elem);
+            }
+
+            if (elem->type == LogEntry::CLEAR_COLUMN)
+            {
+                auto cur_part = MergeTreePartInfo::fromPartName(elem->new_part_name, format_version);
+                auto part = MergeTreePartInfo::fromPartName(entry.new_part_name, format_version);
+
+                if (part.partition_id == cur_part.partition_id)
+                    conflicts.emplace_back(elem);
+            }
+        }
+    }
+
+    if (out_conflicts_description)
+    {
+        std::stringstream ss;
+        ss << "Can't execute " << entry.typeToString() << " entry " << entry.znode_name << ". ";
+        ss << "There are " << conflicts.size() << " currently executing entries blocking it: ";
+        for (const auto & conflict : conflicts)
+            ss << conflict->typeToString() << " " << conflict->new_part_name << " " << conflict->znode_name << ", ";
+
+        *out_conflicts_description = ss.str();
+    }
+
+    return conflicts;
+}
+
+
+void ReplicatedMergeTreeQueue::disableMergesAndFetchesInRange(const LogEntry & entry)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    String conflicts_description;
+
+    if (!getConflictsForClearColumnCommand(entry, &conflicts_description).empty())
+        throw Exception(conflicts_description, ErrorCodes::UNFINISHED);
+
+    if (!future_parts.count(entry.new_part_name))
+        throw Exception("Expected that merges and fetches should be blocked in range " + entry.new_part_name + ". This is a bug", ErrorCodes::LOGICAL_ERROR);
+}
+
+
 bool ReplicatedMergeTreeQueue::isNotCoveredByFuturePartsImpl(const String & new_part_name, String & out_reason)
 {
     /// mutex should been already acquired
@@ -468,19 +569,15 @@ bool ReplicatedMergeTreeQueue::isNotCoveredByFuturePartsImpl(const String & new_
 
     /// A more complex check is whether another part is currently created by other action that will cover this part.
     /// NOTE The above is redundant, but left for a more convenient message in the log.
-    ActiveDataPartSet::Part result_part;
-    ActiveDataPartSet::parsePartName(new_part_name, result_part);
+    auto result_part = MergeTreePartInfo::fromPartName(new_part_name, format_version);
 
     /// It can slow down when the size of `future_parts` is large. But it can not be large, since `BackgroundProcessingPool` is limited.
     for (const auto & future_part_name : future_parts)
     {
-        ActiveDataPartSet::Part future_part;
-        ActiveDataPartSet::parsePartName(future_part_name, future_part);
+        auto future_part = MergeTreePartInfo::fromPartName(future_part_name, format_version);
 
         if (future_part.contains(result_part))
         {
-            out_reason = "Not executing log entry for part " + new_part_name
-                + " because another log entry for covering part " + future_part_name + " is being processed.";
             return false;
         }
     }
@@ -514,7 +611,8 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
     {
         if (!isNotCoveredByFuturePartsImpl(entry.new_part_name, out_postpone_reason))
         {
-            LOG_DEBUG(log, out_postpone_reason);
+            if (!out_postpone_reason.empty())
+                LOG_DEBUG(log, out_postpone_reason);
             return false;
         }
     }
@@ -538,12 +636,12 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
                 return false;
             }
 
-            auto part = data.getPartIfExists(name);
+            auto part = data.getPartIfExists(name, {MergeTreeDataPartState::PreCommitted, MergeTreeDataPartState::Committed, MergeTreeDataPartState::Outdated});
             if (part)
                 sum_parts_size_in_bytes += part->size_in_bytes;
         }
 
-        if (merger.isCancelled())
+        if (merger.merges_blocker.isCancelled())
         {
             String reason = "Not executing log entry for part " + entry.new_part_name + " because merges are cancelled now.";
             LOG_DEBUG(log, reason);
@@ -568,6 +666,16 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
         }
     }
 
+    if (entry.type == LogEntry::CLEAR_COLUMN)
+    {
+        String conflicts_description;
+        if (!getConflictsForClearColumnCommand(entry, &conflicts_description).empty())
+        {
+            LOG_DEBUG(log, conflicts_description);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -577,7 +685,7 @@ ReplicatedMergeTreeQueue::CurrentlyExecuting::CurrentlyExecuting(ReplicatedMerge
 {
     entry->currently_executing = true;
     ++entry->num_tries;
-    entry->last_attempt_time = time(0);
+    entry->last_attempt_time = time(nullptr);
 
     if (!queue.future_parts.insert(entry->new_part_name).second)
         throw Exception("Tagging already tagged future part " + entry->new_part_name + ". This is a bug.", ErrorCodes::LOGICAL_ERROR);
@@ -641,7 +749,7 @@ ReplicatedMergeTreeQueue::SelectedEntry ReplicatedMergeTreeQueue::selectEntryToP
         else
         {
             ++(*it)->num_postponed;
-            (*it)->last_postpone_time = time(0);
+            (*it)->last_postpone_time = time(nullptr);
         }
     }
 

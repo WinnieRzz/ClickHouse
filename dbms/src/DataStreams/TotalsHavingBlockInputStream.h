@@ -19,16 +19,17 @@ private:
     using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 
 public:
+    /// expression may be nullptr
     TotalsHavingBlockInputStream(
-        BlockInputStreamPtr input_,
-        bool overflow_row_, ExpressionActionsPtr expression_,
+        const BlockInputStreamPtr & input_,
+        bool overflow_row_, const ExpressionActionsPtr & expression_,
         const std::string & filter_column_, TotalsMode totals_mode_, double auto_include_threshold_);
 
     String getName() const override { return "TotalsHaving"; }
 
-    String getID() const override;
+    Block getTotals() override;
 
-    const Block & getTotals() override;
+    Block getHeader() const override;
 
 protected:
     Block readImpl() override;
@@ -48,10 +49,12 @@ private:
     Block overflow_aggregates;
 
     /// Here, total values are accumulated. After the work is finished, they will be placed in IProfilingBlockInputStream::totals.
-    Block current_totals;
+    MutableColumns current_totals;
+    /// Arena for aggregate function states in totals.
+    ArenaPtr arena;
 
     /// If filter == nullptr - add all rows. Otherwise, only the rows that pass the filter (HAVING).
-    void addToTotals(Block & totals, Block & block, const IColumn::Filter * filter);
+    void addToTotals(const Block & block, const IColumn::Filter * filter);
 };
 
 }

@@ -18,8 +18,8 @@ namespace DB
   */
 
 
-/// Для случая, когда есть один числовой ключ.
-template <typename FieldType, typename TData>    /// UInt8/16/32/64 для любых типов соответствующей битности.
+/// For the case where there is one numeric key.
+template <typename FieldType, typename TData>    /// UInt8/16/32/64 for any types with corresponding bit width.
 struct SetMethodOneNumber
 {
     using Data = TData;
@@ -27,36 +27,36 @@ struct SetMethodOneNumber
 
     Data data;
 
-    /// Для использования одного Method в разных потоках, используйте разные State.
+    /// To use one `Method` in different threads, use different `State`.
     struct State
     {
         const FieldType * vec;
 
-        /** Вызывается в начале обработки каждого блока.
-          * Устанавливает переменные, необходимые для остальных методов, вызываемых во внутренних циклах.
+        /** Called at the start of each block processing.
+          * Sets the variables required for the other methods called in inner loops.
           */
-        void init(const ConstColumnPlainPtrs & key_columns)
+        void init(const ColumnRawPtrs & key_columns)
         {
             vec = &static_cast<const ColumnVector<FieldType> *>(key_columns[0])->getData()[0];
         }
 
-        /// Достать из ключевых столбцов ключ для вставки в хэш-таблицу.
+        /// Get key from key columns for insertion into hash table.
         Key getKey(
-            const ConstColumnPlainPtrs & key_columns,    /// Ключевые столбцы.
-            size_t keys_size,                            /// Количество ключевых столбцов.
-            size_t i,                        /// Из какой строки блока достать ключ.
-            const Sizes & key_sizes) const    /// Если ключи фиксированной длины - их длины. Не используется в методах по ключам переменной длины.
+            const ColumnRawPtrs & /*key_columns*/,
+            size_t /*keys_size*/,                 /// Number of key columns.
+            size_t i,                             /// From what row of the block I get the key.
+            const Sizes & /*key_sizes*/) const    /// If keys of a fixed length - their lengths. Not used in methods for variable length keys.
         {
             return unionCastToUInt64(vec[i]);
         }
     };
 
-    /** Разместить дополнительные данные, если это необходимо, в случае, когда в хэш-таблицу был вставлен новый ключ.
+    /** Place additional data, if necessary, in case a new key was inserted into the hash table.
       */
-    static void onNewKey(typename Data::value_type & value, size_t keys_size, size_t i, Arena & pool) {}
+    static void onNewKey(typename Data::value_type & /*value*/, size_t /*keys_size*/, Arena & /*pool*/) {}
 };
 
-/// Для случая, когда есть один строковый ключ.
+/// For the case where there is one string key.
 template <typename TData>
 struct SetMethodString
 {
@@ -67,10 +67,10 @@ struct SetMethodString
 
     struct State
     {
-        const ColumnString::Offsets_t * offsets;
+        const ColumnString::Offsets * offsets;
         const ColumnString::Chars_t * chars;
 
-        void init(const ConstColumnPlainPtrs & key_columns)
+        void init(const ColumnRawPtrs & key_columns)
         {
             const IColumn & column = *key_columns[0];
             const ColumnString & column_string = static_cast<const ColumnString &>(column);
@@ -79,10 +79,10 @@ struct SetMethodString
         }
 
         Key getKey(
-            const ConstColumnPlainPtrs & key_columns,
-            size_t keys_size,
+            const ColumnRawPtrs &,
+            size_t,
             size_t i,
-            const Sizes & key_sizes) const
+            const Sizes &) const
         {
             return StringRef(
                 &(*chars)[i == 0 ? 0 : (*offsets)[i - 1]],
@@ -90,13 +90,13 @@ struct SetMethodString
         }
     };
 
-    static void onNewKey(typename Data::value_type & value, size_t keys_size, size_t i, Arena & pool)
+    static void onNewKey(typename Data::value_type & value, size_t, Arena & pool)
     {
         value.data = pool.insert(value.data, value.size);
     }
 };
 
-/// Для случая, когда есть один строковый ключ фиксированной длины.
+/// For the case when there is one fixed-length string key.
 template <typename TData>
 struct SetMethodFixedString
 {
@@ -110,7 +110,7 @@ struct SetMethodFixedString
         size_t n;
         const ColumnFixedString::Chars_t * chars;
 
-        void init(const ConstColumnPlainPtrs & key_columns)
+        void init(const ColumnRawPtrs & key_columns)
         {
             const IColumn & column = *key_columns[0];
             const ColumnFixedString & column_string = static_cast<const ColumnFixedString &>(column);
@@ -119,16 +119,16 @@ struct SetMethodFixedString
         }
 
         Key getKey(
-            const ConstColumnPlainPtrs & key_columns,
-            size_t keys_size,
+            const ColumnRawPtrs &,
+            size_t,
             size_t i,
-            const Sizes & key_sizes) const
+            const Sizes &) const
         {
             return StringRef(&(*chars)[i * n], n);
         }
     };
 
-    static void onNewKey(typename Data::value_type & value, size_t keys_size, size_t i, Arena & pool)
+    static void onNewKey(typename Data::value_type & value, size_t, Arena & pool)
     {
         value.data = pool.insert(value.data, value.size);
     }
@@ -148,18 +148,18 @@ template <typename Key>
 class BaseStateKeysFixed<Key, true>
 {
 protected:
-    void init(const ConstColumnPlainPtrs & key_columns)
+    void init(const ColumnRawPtrs & key_columns)
     {
         null_maps.reserve(key_columns.size());
         actual_columns.reserve(key_columns.size());
 
         for (const auto & col : key_columns)
         {
-            if (col->isNullable())
+            if (col->isColumnNullable())
             {
                 const auto & nullable_col = static_cast<const ColumnNullable &>(*col);
-                actual_columns.push_back(nullable_col.getNestedColumn().get());
-                null_maps.push_back(nullable_col.getNullMapColumn().get());
+                actual_columns.push_back(&nullable_col.getNestedColumn());
+                null_maps.push_back(&nullable_col.getNullMapColumn());
             }
             else
             {
@@ -172,7 +172,7 @@ protected:
     /// Return the columns which actually contain the values of the keys.
     /// For a given key column, if it is nullable, we return its nested
     /// column. Otherwise we return the key column itself.
-    inline const ConstColumnPlainPtrs & getActualColumns() const
+    inline const ColumnRawPtrs & getActualColumns() const
     {
         return actual_columns;
     }
@@ -201,8 +201,8 @@ protected:
     }
 
 private:
-    ConstColumnPlainPtrs actual_columns;
-    ConstColumnPlainPtrs null_maps;
+    ColumnRawPtrs actual_columns;
+    ColumnRawPtrs null_maps;
 };
 
 /// Case where nullable keys are not supported.
@@ -210,19 +210,19 @@ template <typename Key>
 class BaseStateKeysFixed<Key, false>
 {
 protected:
-    void init(const ConstColumnPlainPtrs & key_columns)
+    void init(const ColumnRawPtrs &)
     {
         throw Exception{"Internal error: calling init() for non-nullable"
             " keys is forbidden", ErrorCodes::LOGICAL_ERROR};
     }
 
-    const ConstColumnPlainPtrs & getActualColumns() const
+    const ColumnRawPtrs & getActualColumns() const
     {
         throw Exception{"Internal error: calling getActualColumns() for non-nullable"
             " keys is forbidden", ErrorCodes::LOGICAL_ERROR};
     }
 
-    KeysNullMap<Key> createBitmap(size_t row) const
+    KeysNullMap<Key> createBitmap(size_t) const
     {
         throw Exception{"Internal error: calling createBitmap() for non-nullable keys"
             " is forbidden", ErrorCodes::LOGICAL_ERROR};
@@ -231,7 +231,7 @@ protected:
 
 }
 
-/// Для случая, когда все ключи фиксированной длины, и они помещаются в N (например, 128) бит.
+/// For the case when all keys are of fixed length, and they fit in N (for example, 128) bits.
 template <typename TData, bool has_nullable_keys_ = false>
 struct SetMethodKeysFixed
 {
@@ -246,14 +246,14 @@ struct SetMethodKeysFixed
     public:
         using Base = set_impl::BaseStateKeysFixed<Key, has_nullable_keys>;
 
-        void init(const ConstColumnPlainPtrs & key_columns)
+        void init(const ColumnRawPtrs & key_columns)
         {
             if (has_nullable_keys)
                 Base::init(key_columns);
         }
 
         Key getKey(
-            const ConstColumnPlainPtrs & key_columns,
+            const ColumnRawPtrs & key_columns,
             size_t keys_size,
             size_t i,
             const Sizes & key_sizes) const
@@ -268,10 +268,10 @@ struct SetMethodKeysFixed
         }
     };
 
-    static void onNewKey(typename Data::value_type & value, size_t keys_size, size_t i, Arena & pool) {}
+    static void onNewKey(typename Data::value_type &, size_t, Arena &) {}
 };
 
-/// Для остальных случаев. По 128 битному хэшу от ключа.
+/// For other cases. 128 bit hash from the key.
 template <typename TData>
 struct SetMethodHashed
 {
@@ -282,35 +282,35 @@ struct SetMethodHashed
 
     struct State
     {
-        void init(const ConstColumnPlainPtrs & key_columns)
+        void init(const ColumnRawPtrs &)
         {
         }
 
         Key getKey(
-            const ConstColumnPlainPtrs & key_columns,
+            const ColumnRawPtrs & key_columns,
             size_t keys_size,
             size_t i,
-            const Sizes & key_sizes) const
+            const Sizes &) const
         {
             return hash128(i, keys_size, key_columns);
         }
     };
 
-    static void onNewKey(typename Data::value_type & value, size_t keys_size, size_t i, Arena & pool) {}
+    static void onNewKey(typename Data::value_type &, size_t, Arena &) {}
 };
 
 
-/** Разные варианты реализации множества.
+/** Different implementations of the set.
   */
 struct NonClearableSet
 {
-    /// TODO Использовать для этих двух вариантов bit- или byte- set.
+    /// TODO Use either bit- or byte-set for these two options.
     std::unique_ptr<SetMethodOneNumber<UInt8, HashSet<UInt8, TrivialHash, HashTableFixedGrower<8>>>>            key8;
     std::unique_ptr<SetMethodOneNumber<UInt16, HashSet<UInt16, TrivialHash, HashTableFixedGrower<16>>>>         key16;
 
-    /** Также для эксперимента проверялась возможность использовать SmallSet,
-      *  пока количество элементов в множестве небольшое (и, при необходимости, конвертировать в полноценный HashSet).
-      * Но этот эксперимент показал, что преимущество есть только в редких случаях.
+    /** Also for the experiment was tested the ability to use SmallSet,
+      *  as long as the number of elements in the set is small (and, if necessary, converted to a full-fledged HashSet).
+      * But this experiment showed that there is an advantage only in rare cases.
       */
     std::unique_ptr<SetMethodOneNumber<UInt32, HashSet<UInt32, HashCRC32<UInt32>>>>                             key32;
     std::unique_ptr<SetMethodOneNumber<UInt64, HashSet<UInt64, HashCRC32<UInt64>>>>                             key64;
@@ -323,15 +323,15 @@ struct NonClearableSet
     /// Support for nullable keys (for DISTINCT implementation).
     std::unique_ptr<SetMethodKeysFixed<HashSet<UInt128, UInt128HashCRC32>, true>>                               nullable_keys128;
     std::unique_ptr<SetMethodKeysFixed<HashSet<UInt256, UInt256HashCRC32>, true>>                               nullable_keys256;
-    /** В отличие от Aggregator, здесь не используется метод concat.
-      * Это сделано потому что метод hashed, хоть и медленнее, но в данном случае, использует меньше оперативки.
-      *  так как при его использовании, сами значения ключей не сохраняются.
+    /** Unlike Aggregator, `concat` method is not used here.
+      * This is done because `hashed` method, although slower, but in this case, uses less RAM.
+      *  since when you use it, the key values themselves are not stored.
       */
 };
 
 struct ClearableSet
 {
-    /// TODO Использовать для этих двух вариантов bit- или byte- set.
+    /// TODO Use either bit- or byte-set for these two options.
     std::unique_ptr<SetMethodOneNumber<UInt8, ClearableHashSet<UInt8, TrivialHash, HashTableFixedGrower<8>>>>       key8;
     std::unique_ptr<SetMethodOneNumber<UInt16, ClearableHashSet<UInt16, TrivialHash, HashTableFixedGrower<16>>>>    key16;
 
@@ -346,9 +346,9 @@ struct ClearableSet
     /// Support for nullable keys (for DISTINCT implementation).
     std::unique_ptr<SetMethodKeysFixed<ClearableHashSet<UInt128, UInt128HashCRC32>, true>>                          nullable_keys128;
     std::unique_ptr<SetMethodKeysFixed<ClearableHashSet<UInt256, UInt256HashCRC32>, true>>                          nullable_keys256;
-    /** В отличие от Aggregator, здесь не используется метод concat.
-      * Это сделано потому что метод hashed, хоть и медленнее, но в данном случае, использует меньше оперативки.
-      *  так как при его использовании, сами значения ключей не сохраняются.
+    /** Unlike Aggregator, `concat` method is not used here.
+      * This is done because `hashed` method, although slower, but in this case, uses less RAM.
+      *  since when you use it, the key values themselves are not stored.
       */
 };
 
@@ -387,12 +387,12 @@ struct SetVariantsTemplate: public Variant
 
     bool empty() const { return type == Type::EMPTY; }
 
-    static Type chooseMethod(const ConstColumnPlainPtrs & key_columns, Sizes & key_sizes);
+    static Type chooseMethod(const ColumnRawPtrs & key_columns, Sizes & key_sizes);
 
     void init(Type type_);
 
     size_t getTotalRowCount() const;
-    /// Считает размер в байтах буфера Set и размер string_pool'а
+    /// Counts the size in bytes of the Set buffer and the size of the `string_pool`
     size_t getTotalByteCount() const;
 };
 

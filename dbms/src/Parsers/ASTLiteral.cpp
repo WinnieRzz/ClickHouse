@@ -1,5 +1,5 @@
 #include <Common/SipHash.h>
-#include <Core/FieldVisitors.h>
+#include <Common/FieldVisitors.h>
 #include <Parsers/ASTLiteral.h>
 #include <IO/WriteHelpers.h>
 
@@ -8,7 +8,7 @@ namespace DB
 {
 
 
-String ASTLiteral::getColumnName() const
+String ASTLiteral::getColumnNameImpl() const
 {
     /// Special case for very large arrays. Instead of listing all elements, will use hash of them.
     /// (Otherwise column name will be too long, that will lead to significant slowdown of expression analysis.)

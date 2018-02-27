@@ -1,13 +1,11 @@
-include_directories (${ClickHouse_SOURCE_DIR}/dbms/src)
-include_directories (${ClickHouse_SOURCE_DIR}/libs/libcommon/include)
 
 add_executable (iotest iotest.cpp ${SRCS})
-target_link_libraries (iotest dbms)
+target_link_libraries (iotest clickhouse_common_io)
 
 add_executable (iotest_nonblock iotest_nonblock.cpp ${SRCS})
-target_link_libraries (iotest_nonblock dbms)
+target_link_libraries (iotest_nonblock clickhouse_common_io)
 
-if (NOT APPLE AND NOT CMAKE_SYSTEM MATCHES "FreeBSD")
+if (NOT APPLE AND NOT ARCH_FREEBSD)
     add_executable (iotest_aio iotest_aio.cpp ${SRCS})
-    target_link_libraries (iotest_aio dbms)
+    target_link_libraries (iotest_aio clickhouse_common_io)
 endif()

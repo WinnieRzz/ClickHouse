@@ -12,48 +12,34 @@ namespace DB
 
 StorageSystemBuildOptions::StorageSystemBuildOptions(const std::string & name_)
     : name(name_)
-    , columns{
-        { "name",             std::make_shared<DataTypeString>()    },
-        { "value",            std::make_shared<DataTypeString>()    },
-    }
 {
-}
-
-StoragePtr StorageSystemBuildOptions::create(const std::string & name_)
-{
-    return make_shared(name_);
+    columns = NamesAndTypesList{
+        { "name", std::make_shared<DataTypeString>() },
+        { "value", std::make_shared<DataTypeString>() },
+    };
 }
 
 
 BlockInputStreams StorageSystemBuildOptions::read(
     const Names & column_names,
-    ASTPtr query,
-    const Context & context,
-    const Settings & settings,
+    const SelectQueryInfo &,
+    const Context &,
     QueryProcessingStage::Enum & processed_stage,
-    const size_t max_block_size,
-    const unsigned threads)
+    const size_t /*max_block_size*/,
+    const unsigned /*num_streams*/)
 {
     check(column_names);
     processed_stage = QueryProcessingStage::FetchColumns;
 
-    ColumnWithTypeAndName col_name{std::make_shared<ColumnString>(), std::make_shared<DataTypeString>(), "name"};
-    ColumnWithTypeAndName col_value{std::make_shared<ColumnString>(), std::make_shared<DataTypeString>(), "value"};
+    MutableColumns res_columns = getSampleBlock().cloneEmptyColumns();
 
-    for (auto it = auto_config_build.begin(); it != auto_config_build.end(); ++it) {
-        col_name.column->insert(String(*it));
-        ++it;
-        if (it == auto_config_build.end())
-            break;
-        col_value.column->insert(String(*it));
+    for (auto it = auto_config_build; *it; it += 2)
+    {
+        res_columns[0]->insert(String(it[0]));
+        res_columns[1]->insert(String(it[1]));
     }
 
-    Block block{
-        col_name,
-        col_value,
-    };
-
-    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(block));
+    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(getSampleBlock().cloneWithColumns(std::move(res_columns))));
 }
 
 

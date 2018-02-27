@@ -1,16 +1,32 @@
 #include <DataStreams/ReplacingSortedBlockInputStream.h>
 #include <Columns/ColumnsNumber.h>
+#include <common/logger_useful.h>
 
 
 namespace DB
 {
 
-
-void ReplacingSortedBlockInputStream::insertRow(ColumnPlainPtrs & merged_columns, size_t & merged_rows)
+namespace ErrorCodes
 {
+    extern const int LOGICAL_ERROR;
+}
+
+
+void ReplacingSortedBlockInputStream::insertRow(MutableColumns & merged_columns, size_t & merged_rows)
+{
+    if (out_row_sources_buf)
+    {
+        /// true flag value means "skip row"
+        current_row_sources[max_pos].setSkipFlag(false);
+
+        out_row_sources_buf->write(reinterpret_cast<const char *>(current_row_sources.data()),
+                                   current_row_sources.size() * sizeof(RowSourcePart));
+        current_row_sources.resize(0);
+    }
+
     ++merged_rows;
     for (size_t i = 0; i < num_columns; ++i)
-        merged_columns[i]->insertFrom(*selected_row.columns[i], selected_row.row_num);
+        merged_columns[i]->insertFrom(*(*selected_row.columns)[i], selected_row.row_num);
 }
 
 
@@ -22,48 +38,40 @@ Block ReplacingSortedBlockInputStream::readImpl()
     if (children.size() == 1)
         return children[0]->read();
 
-    Block merged_block;
-    ColumnPlainPtrs merged_columns;
+    Block header;
+    MutableColumns merged_columns;
 
-    init(merged_block, merged_columns);
+    init(header, merged_columns);
+
+    if (has_collation)
+        throw Exception("Logical error: " + getName() + " does not support collations", ErrorCodes::LOGICAL_ERROR);
+
     if (merged_columns.empty())
         return Block();
 
     /// Additional initialization.
     if (selected_row.empty())
     {
-        selected_row.columns.resize(num_columns);
-
         if (!version_column.empty())
-            version_column_number = merged_block.getPositionByName(version_column);
+            version_column_number = header.getPositionByName(version_column);
     }
 
-    if (has_collation)
-        merge(merged_columns, queue_with_collation);
-    else
-        merge(merged_columns, queue);
-
-    return merged_block;
+    merge(merged_columns, queue);
+    return header.cloneWithColumns(std::move(merged_columns));
 }
 
 
-template<class TSortCursor>
-void ReplacingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue)
+void ReplacingSortedBlockInputStream::merge(MutableColumns & merged_columns, std::priority_queue<SortCursor> & queue)
 {
     size_t merged_rows = 0;
 
-    /// Take the rows in needed order and put them into `merged_block` until rows no more than `max_block_size`
+    /// Take the rows in needed order and put them into `merged_columns` until rows no more than `max_block_size`
     while (!queue.empty())
     {
-        TSortCursor current = queue.top();
+        SortCursor current = queue.top();
 
         if (current_key.empty())
-        {
-            current_key.columns.resize(description.size());
-            next_key.columns.resize(description.size());
-
             setPrimaryKeyRef(current_key, current);
-        }
 
         UInt64 version = version_column_number != -1
             ? current->all_columns[version_column_number]->get64(current->pos)
@@ -87,10 +95,16 @@ void ReplacingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, st
             current_key.swap(next_key);
         }
 
+        /// Initially, skip all rows. Unskip last on insert.
+        size_t current_pos = current_row_sources.size();
+        if (out_row_sources_buf)
+            current_row_sources.emplace_back(current.impl->order, true);
+
         /// A non-strict comparison, since we select the last row for the same version values.
         if (version >= max_version)
         {
             max_version = version;
+            max_pos = current_pos;
             setRowRef(selected_row, current);
         }
 

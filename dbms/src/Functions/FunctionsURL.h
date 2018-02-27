@@ -2,9 +2,10 @@
 
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnString.h>
-#include <Columns/ColumnConst.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <Common/StringView.h>
+#include <Common/typeid_cast.h>
+#include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionsString.h>
 #include <Functions/FunctionsStringArray.h>
 
@@ -258,7 +259,7 @@ struct ExtractTopLevelDomain
 
             if (!last_dot)
                 return;
-            /// Для IPv4-адресов не выделяем ничего.
+            /// For IPv4 addresses select nothing.
             if (last_dot[1] <= '9')
                 return;
 
@@ -380,7 +381,7 @@ struct ExtractQueryStringAndFragment
     }
 };
 
-/// С точкой на конце.
+/// With dot at the end.
 struct ExtractWWW
 {
     static void execute(Pos data, size_t size, Pos & res_data, size_t & res_size)
@@ -411,9 +412,9 @@ struct ExtractWWW
 struct ExtractURLParameterImpl
 {
     static void vector(const ColumnString::Chars_t & data,
-                        const ColumnString::Offsets_t & offsets,
+                        const ColumnString::Offsets & offsets,
                         std::string pattern,
-                        ColumnString::Chars_t & res_data, ColumnString::Offsets_t & res_offsets)
+                        ColumnString::Chars_t & res_data, ColumnString::Offsets & res_offsets)
     {
         res_data.reserve(data.size()  / 5);
         res_offsets.resize(offsets.size());
@@ -433,7 +434,7 @@ struct ExtractURLParameterImpl
 
             const char * pos = nullptr;
             const char * begin = strpbrk(str, "?#");
-            if (begin != nullptr)
+            if (begin)
             {
                 pos = begin + 1;
                 while (true)
@@ -456,7 +457,7 @@ struct ExtractURLParameterImpl
                 }
             }
 
-            if (pos != nullptr)
+            if (pos)
             {
                 const char * end = strpbrk(pos, "&#");
                 if (end == nullptr)
@@ -484,9 +485,9 @@ struct ExtractURLParameterImpl
 struct CutURLParameterImpl
 {
     static void vector(const ColumnString::Chars_t & data,
-                        const ColumnString::Offsets_t & offsets,
+                        const ColumnString::Offsets & offsets,
                         std::string pattern,
-                        ColumnString::Chars_t & res_data, ColumnString::Offsets_t & res_offsets)
+                        ColumnString::Chars_t & res_data, ColumnString::Offsets & res_offsets)
     {
         res_data.reserve(data.size());
         res_offsets.resize(offsets.size());
@@ -526,11 +527,11 @@ struct CutURLParameterImpl
                 begin_pos = pos;
                 end_pos = begin_pos + param_len;
 
-                /// Пропустим значение.
+                /// Skip the value.
                 while (*end_pos && *end_pos != '&' && *end_pos != '#')
                     ++end_pos;
 
-                /// Захватим '&' до или после параметра.
+                /// Capture '&' before or after the parameter.
                 if (*end_pos == '&')
                     ++end_pos;
                 else if (begin_pos[-1] == '&')
@@ -566,20 +567,20 @@ public:
 
     static void checkArguments(const DataTypes & arguments)
     {
-        if (!typeid_cast<const DataTypeString *>(&*arguments[0]))
+        if (!arguments[0]->isString())
             throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + ". Must be String.",
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
-    void init(Block & block, const ColumnNumbers & arguments) {}
+    void init(Block & /*block*/, const ColumnNumbers & /*arguments*/) {}
 
-    /// Возвращает позицию аргумента, являющегося столбцом строк
+    /// Returns the position of the argument that is the column of rows
     size_t getStringsArgumentPosition()
     {
         return 0;
     }
 
-    /// Вызывается для каждой следующей строки.
+    /// Called for each next string.
     void set(Pos pos_, Pos end_)
     {
         pos = pos_;
@@ -587,7 +588,7 @@ public:
         first = true;
     }
 
-    /// Получить следующий токен, если есть, или вернуть false.
+    /// Get the next token, if any, or return false.
     bool get(Pos & token_begin, Pos & token_end)
     {
         if (pos == nullptr)
@@ -651,20 +652,20 @@ public:
 
     static void checkArguments(const DataTypes & arguments)
     {
-        if (!typeid_cast<const DataTypeString *>(&*arguments[0]))
+        if (!arguments[0]->isString())
             throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + ". Must be String.",
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
-    /// Возвращает позицию аргумента, являющегося столбцом строк
+    /// Returns the position of the argument that is the column of rows
     size_t getStringsArgumentPosition()
     {
         return 0;
     }
 
-    void init(Block & block, const ColumnNumbers & arguments) {}
+    void init(Block & /*block*/, const ColumnNumbers & /*arguments*/) {}
 
-    /// Вызывается для каждой следующей строки.
+    /// Called for each next string.
     void set(Pos pos_, Pos end_)
     {
         pos = pos_;
@@ -672,7 +673,7 @@ public:
         first = true;
     }
 
-    /// Получить следующий токен, если есть, или вернуть false.
+    /// Get the next token, if any, or return false.
     bool get(Pos & token_begin, Pos & token_end)
     {
         if (pos == nullptr)
@@ -728,45 +729,44 @@ public:
 
     static void checkArguments(const DataTypes & arguments)
     {
-        if (!typeid_cast<const DataTypeString *>(&*arguments[0]))
+        if (!arguments[0]->isString())
             throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + ". Must be String.",
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
-    void init(Block & block, const ColumnNumbers & arguments) {}
+    void init(Block & /*block*/, const ColumnNumbers & /*arguments*/) {}
 
-    /// Возвращает позицию аргумента, являющегося столбцом строк
+    /// Returns the position of the argument that is the column of rows
     size_t getStringsArgumentPosition()
     {
         return 0;
     }
 
-    /// Вызывается для каждой следующей строки.
+    /// Called for each next string.
     void set(Pos pos_, Pos end_)
     {
         begin = pos = pos_;
         end = end_;
     }
 
-    /// Получить следующий токен, если есть, или вернуть false.
+    /// Get the next token, if any, or return false.
     bool get(Pos & token_begin, Pos & token_end)
     {
-        /// Код из URLParser.
-
+        /// Code from URLParser.
         if (pos == end)
             return false;
 
         if (pos == begin)
         {
-            /// Распарсим всё, что идёт до пути
+            /// Let's parse everything that goes before the path
 
-            /// Предположим, что протокол уже переведён в нижний регистр.
+            /// Assume that the protocol has already been changed to lowercase.
             while (pos < end && ((*pos > 'a' && *pos < 'z') || (*pos > '0' && *pos < '9')))
                 ++pos;
 
-            /** Будем вычислять иерархию только для URL-ов, в которых есть протокол, и после него идут два слеша.
-             * (http, file - подходят, mailto, magnet - не подходят), и после двух слешей ещё хоть что-нибудь есть
-             * Для остальных просто вернём полный URL как единственный элемент иерархии.
+            /** We will calculate the hierarchy only for URLs in which there is a protocol, and after it there are two slashes.
+             * (http, file - fit, mailto, magnet - do not fit), and after two slashes still at least something is there
+             * For the rest, simply return the full URL as the only element of the hierarchy.
              */
             if (pos == begin || pos == end || !(*pos++ == ':' && pos < end && *pos++ == '/' && pos < end && *pos++ == '/' && pos < end))
             {
@@ -776,7 +776,7 @@ public:
                 return true;
             }
 
-            /// Доменом для простоты будем считать всё, что после протокола и двух слешей, до следующего слеша или до ? или до #
+            /// The domain for simplicity is everything that after the protocol and two slashes, until the next slash or `?` or `#`
             while (pos < end && !(*pos == '/' || *pos == '?' || *pos == '#'))
                 ++pos;
 
@@ -789,7 +789,7 @@ public:
             return true;
         }
 
-        /// Идём до следующего / или ? или #, пропуская все те, что вначале.
+        /// We go to the next `/` or `?` or `#`, skipping all those at the beginning.
         while (pos < end && (*pos == '/' || *pos == '?' || *pos == '#'))
             ++pos;
         if (pos == end)
@@ -824,20 +824,20 @@ public:
 
     static void checkArguments(const DataTypes & arguments)
     {
-        if (!typeid_cast<const DataTypeString *>(&*arguments[0]))
+        if (!arguments[0]->isString())
             throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + ". Must be String.",
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
-    void init(Block & block, const ColumnNumbers & arguments) {}
+    void init(Block & /*block*/, const ColumnNumbers & /*arguments*/) {}
 
-    /// Возвращает позицию аргумента, являющегося столбцом строк
+    /// Returns the position of the argument that is the column of rows
     size_t getStringsArgumentPosition()
     {
         return 0;
     }
 
-    /// Вызывается для каждой следующей строки.
+    /// Called for each next string.
     void set(Pos pos_, Pos end_)
     {
         begin = pos = pos_;
@@ -845,25 +845,25 @@ public:
         end = end_;
     }
 
-    /// Получить следующий токен, если есть, или вернуть false.
+    /// Get the next token, if any, or return false.
     bool get(Pos & token_begin, Pos & token_end)
     {
-        /// Код из URLParser.
+        /// Code from URLParser.
 
         if (pos == end)
             return false;
 
         if (pos == begin)
         {
-            /// Распарсим всё, что идёт до пути
+            /// Let's parse everything that goes before the path
 
-            /// Предположим, что протокол уже переведён в нижний регистр.
+            /// Assume that the protocol has already been changed to lowercase.
             while (pos < end && ((*pos > 'a' && *pos < 'z') || (*pos > '0' && *pos < '9')))
                 ++pos;
 
-            /** Будем вычислять иерархию только для URL-ов, в которых есть протокол, и после него идут два слеша.
-             * (http, file - подходят, mailto, magnet - не подходят), и после двух слешей ещё хоть что-нибудь есть
-             * Для остальных просто вернём пустой массив.
+            /** We will calculate the hierarchy only for URLs in which there is a protocol, and after it there are two slashes.
+             * (http, file - fit, mailto, magnet - do not fit), and after two slashes still at least something is there.
+             * For the rest, just return an empty array.
              */
             if (pos == begin || pos == end || !(*pos++ == ':' && pos < end && *pos++ == '/' && pos < end && *pos++ == '/' && pos < end))
             {
@@ -871,7 +871,7 @@ public:
                 return false;
             }
 
-            /// Доменом для простоты будем считать всё, что после протокола и двух слешей, до следующего слеша или до ? или до #
+            /// The domain for simplicity is everything that after the protocol and the two slashes, until the next slash or `?` or `#`
             while (pos < end && !(*pos == '/' || *pos == '?' || *pos == '#'))
                 ++pos;
 
@@ -881,7 +881,7 @@ public:
                 ++pos;
         }
 
-        /// Идём до следующего / или ? или #, пропуская все те, что вначале.
+        /// We go to the next `/` or `?` or `#`, skipping all those at the beginning.
         while (pos < end && (*pos == '/' || *pos == '?' || *pos == '#'))
             ++pos;
         if (pos == end)
@@ -900,13 +900,13 @@ public:
 };
 
 
-/** Выделить кусок строки, используя Extractor.
+/** Select part of string using the Extractor.
   */
 template <typename Extractor>
 struct ExtractSubstringImpl
 {
-    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets_t & offsets,
-        ColumnString::Chars_t & res_data, ColumnString::Offsets_t & res_offsets)
+    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets & offsets,
+        ColumnString::Chars_t & res_data, ColumnString::Offsets & res_offsets)
     {
         size_t size = offsets.size();
         res_offsets.resize(size);
@@ -915,7 +915,7 @@ struct ExtractSubstringImpl
         size_t prev_offset = 0;
         size_t res_offset = 0;
 
-        /// Выделенный кусок.
+        /// Matched part.
         Pos start;
         size_t length;
 
@@ -942,21 +942,20 @@ struct ExtractSubstringImpl
         res_data.assign(start, length);
     }
 
-    static void vector_fixed(const ColumnString::Chars_t & data, size_t n,
-        ColumnString::Chars_t & res_data)
+    static void vector_fixed(const ColumnString::Chars_t &, size_t, ColumnString::Chars_t &)
     {
         throw Exception("Column of type FixedString is not supported by URL functions", ErrorCodes::ILLEGAL_COLUMN);
     }
 };
 
 
-/** Удалить кусок строки, используя Extractor.
+/** Delete part of string using the Extractor.
   */
 template <typename Extractor>
 struct CutSubstringImpl
 {
-    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets_t & offsets,
-        ColumnString::Chars_t & res_data, ColumnString::Offsets_t & res_offsets)
+    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets & offsets,
+        ColumnString::Chars_t & res_data, ColumnString::Offsets & res_offsets)
     {
         res_data.reserve(data.size());
         size_t size = offsets.size();
@@ -965,7 +964,7 @@ struct CutSubstringImpl
         size_t prev_offset = 0;
         size_t res_offset = 0;
 
-        /// Выделенный кусок.
+        /// Matched part.
         Pos start;
         size_t length;
 
@@ -998,8 +997,7 @@ struct CutSubstringImpl
         res_data.append(start + length, data.data() + data.size());
     }
 
-    static void vector_fixed(const ColumnString::Chars_t & data, size_t n,
-        ColumnString::Chars_t & res_data)
+    static void vector_fixed(const ColumnString::Chars_t &, size_t, ColumnString::Chars_t &)
     {
         throw Exception("Column of type FixedString is not supported by URL functions", ErrorCodes::ILLEGAL_COLUMN);
     }
@@ -1009,8 +1007,8 @@ struct CutSubstringImpl
 /// Percent decode of url data.
 struct DecodeURLComponentImpl
 {
-    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets_t & offsets,
-        ColumnString::Chars_t & res_data, ColumnString::Offsets_t & res_offsets);
+    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets & offsets,
+        ColumnString::Chars_t & res_data, ColumnString::Offsets & res_offsets);
 
     static void constant(const std::string & data,
         std::string & res_data);

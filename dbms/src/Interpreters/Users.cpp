@@ -14,14 +14,14 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/SimpleCache.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <Interpreters/Users.h>
 
 #include <openssl/sha.h>
 
 #include <common/logger_useful.h>
 
-#include <ext/scope_guard.hpp>
+#include <ext/scope_guard.h>
 
 
 namespace DB
@@ -162,7 +162,7 @@ private:
     }
 
 public:
-    HostExactPattern(const String & host_) : host(host_) {}
+    explicit HostExactPattern(const String & host_) : host(host_) {}
 
     bool contains(const Poco::Net::IPAddress & addr) const override
     {
@@ -192,7 +192,7 @@ private:
     }
 
 public:
-    HostRegexpPattern(const String & host_regexp_) : host_regexp(host_regexp_) {}
+    explicit HostRegexpPattern(const String & host_regexp_) : host_regexp(host_regexp_) {}
 
     bool contains(const Poco::Net::IPAddress & addr) const override
     {
@@ -284,8 +284,8 @@ User::User(const String & name_, const String & config_elem, Poco::Util::Abstrac
             throw Exception("password_sha256_hex for user " + name + " has length " + toString(password_sha256_hex.size()) + " but must be exactly 64 symbols.", ErrorCodes::BAD_ARGUMENTS);
     }
 
-    profile     = config.getString(config_elem + ".profile");
-    quota         = config.getString(config_elem + ".quota");
+    profile = config.getString(config_elem + ".profile");
+    quota = config.getString(config_elem + ".quota");
 
     addresses.addFromConfig(config_elem + ".networks", config);
 
@@ -303,75 +303,6 @@ User::User(const String & name_, const String & config_elem, Poco::Util::Abstrac
             databases.insert(database_name);
         }
     }
-}
-
-
-void Users::loadFromConfig(Poco::Util::AbstractConfiguration & config)
-{
-    cont.clear();
-
-    Poco::Util::AbstractConfiguration::Keys config_keys;
-    config.keys("users", config_keys);
-
-    for (const std::string & key : config_keys)
-        cont[key] = User(key, "users." + key, config);
-}
-
-const User & Users::get(const String & name, const String & password, const Poco::Net::IPAddress & address) const
-{
-    Container::const_iterator it = cont.find(name);
-
-    if (cont.end() == it)
-        throw Exception("Unknown user " + name, ErrorCodes::UNKNOWN_USER);
-
-    if (!it->second.addresses.contains(address))
-        throw Exception("User " + name + " is not allowed to connect from address " + address.toString(), ErrorCodes::IP_ADDRESS_NOT_ALLOWED);
-
-    auto on_wrong_password = [&]()
-    {
-        if (password.empty())
-            throw Exception("Password required for user " + name, ErrorCodes::REQUIRED_PASSWORD);
-        else
-            throw Exception("Wrong password for user " + name, ErrorCodes::WRONG_PASSWORD);
-    };
-
-    if (!it->second.password_sha256_hex.empty())
-    {
-        unsigned char hash[32];
-
-        SHA256_CTX ctx;
-        SHA256_Init(&ctx);
-        SHA256_Update(&ctx, reinterpret_cast<const unsigned char *>(password.data()), password.size());
-        SHA256_Final(hash, &ctx);
-
-        String hash_hex;
-        {
-            WriteBufferFromString buf(hash_hex);
-            HexWriteBuffer hex_buf(buf);
-            hex_buf.write(reinterpret_cast<const char *>(hash), sizeof(hash));
-        }
-
-        Poco::toLowerInPlace(hash_hex);
-
-        if (hash_hex != it->second.password_sha256_hex)
-            on_wrong_password();
-    }
-    else if (password != it->second.password)
-    {
-        on_wrong_password();
-    }
-
-    return it->second;
-}
-
-bool Users::isAllowedDatabase(const std::string & user_name, const std::string & database_name) const
-{
-    auto it = cont.find(user_name);
-    if (it == cont.end())
-        throw Exception("Unknown user " + user_name, ErrorCodes::UNKNOWN_USER);
-
-    const auto & user = it->second;
-    return user.databases.empty() || user.databases.count(database_name);
 }
 
 

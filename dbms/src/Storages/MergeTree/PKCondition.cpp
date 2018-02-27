@@ -7,14 +7,13 @@
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeString.h>
-#include <Columns/ColumnSet.h>
-#include <Columns/ColumnTuple.h>
-#include <Parsers/ASTSet.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/IFunction.h>
-#include <Core/FieldVisitors.h>
+#include <Common/FieldVisitors.h>
+#include <Common/typeid_cast.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/Set.h>
+#include <Parsers/queryToString.h>
 
 
 namespace DB
@@ -50,6 +49,7 @@ static String extractFixedPrefixFromLikePattern(const String & like_pattern)
         switch (*pos)
         {
             case '%':
+                [[fallthrough]];
             case '_':
                 return fixed_prefix;
 
@@ -57,6 +57,7 @@ static String extractFixedPrefixFromLikePattern(const String & like_pattern)
                 ++pos;
                 if (pos == end)
                     break;
+                [[fallthrough]];
             default:
                 fixed_prefix += *pos;
                 break;
@@ -100,7 +101,7 @@ const PKCondition::AtomMap PKCondition::atom_map
 {
     {
         "notEquals",
-        [] (RPNElement & out, const Field & value, ASTPtr &)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             out.function = RPNElement::FUNCTION_NOT_IN_RANGE;
             out.range = Range(value);
@@ -109,7 +110,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "equals",
-        [] (RPNElement & out, const Field & value, ASTPtr &)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             out.function = RPNElement::FUNCTION_IN_RANGE;
             out.range = Range(value);
@@ -118,7 +119,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "less",
-        [] (RPNElement & out, const Field & value, ASTPtr &)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             out.function = RPNElement::FUNCTION_IN_RANGE;
             out.range = Range::createRightBounded(value, false);
@@ -127,7 +128,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "greater",
-        [] (RPNElement & out, const Field & value, ASTPtr &)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             out.function = RPNElement::FUNCTION_IN_RANGE;
             out.range = Range::createLeftBounded(value, false);
@@ -136,7 +137,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "lessOrEquals",
-        [] (RPNElement & out, const Field & value, ASTPtr &)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             out.function = RPNElement::FUNCTION_IN_RANGE;
             out.range = Range::createRightBounded(value, true);
@@ -145,7 +146,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "greaterOrEquals",
-        [] (RPNElement & out, const Field & value, ASTPtr &)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             out.function = RPNElement::FUNCTION_IN_RANGE;
             out.range = Range::createLeftBounded(value, true);
@@ -154,7 +155,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "in",
-        [] (RPNElement & out, const Field &, ASTPtr & node)
+        [] (RPNElement & out, const Field &, const ASTPtr & node)
         {
             out.function = RPNElement::FUNCTION_IN_SET;
             out.in_function = node;
@@ -163,7 +164,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "notIn",
-        [] (RPNElement & out, const Field &, ASTPtr & node)
+        [] (RPNElement & out, const Field &, const ASTPtr & node)
         {
             out.function = RPNElement::FUNCTION_NOT_IN_SET;
             out.in_function = node;
@@ -172,7 +173,7 @@ const PKCondition::AtomMap PKCondition::atom_map
     },
     {
         "like",
-        [] (RPNElement & out, const Field & value, ASTPtr & node)
+        [] (RPNElement & out, const Field & value, const ASTPtr &)
         {
             if (value.getType() != Field::Types::String)
                 return false;
@@ -198,6 +199,45 @@ inline bool Range::equals(const Field & lhs, const Field & rhs) { return applyVi
 inline bool Range::less(const Field & lhs, const Field & rhs) { return applyVisitor(FieldVisitorAccurateLess(), lhs, rhs); }
 
 
+FieldWithInfinity::FieldWithInfinity(const Field & field_)
+    : field(field_),
+    type(Type::NORMAL)
+{
+}
+
+FieldWithInfinity::FieldWithInfinity(Field && field_)
+    : field(std::move(field_)),
+    type(Type::NORMAL)
+{
+}
+
+FieldWithInfinity::FieldWithInfinity(const Type type_)
+    : field(),
+    type(type_)
+{
+}
+
+FieldWithInfinity FieldWithInfinity::getMinusInfinity()
+{
+    return FieldWithInfinity(Type::MINUS_INFINITY);
+}
+
+FieldWithInfinity FieldWithInfinity::getPlusinfinity()
+{
+    return FieldWithInfinity(Type::PLUS_INFINITY);
+}
+
+bool FieldWithInfinity::operator<(const FieldWithInfinity & other) const
+{
+    return type < other.type || (type == other.type && type == Type::NORMAL && field < other.field);
+}
+
+bool FieldWithInfinity::operator==(const FieldWithInfinity & other) const
+{
+    return type == other.type && (type != Type::NORMAL || field == other.field);
+}
+
+
 /** Calculate expressions, that depend only on constants.
   * For index to work when something like "WHERE Date = toDate(now())" is written.
   */
@@ -206,11 +246,10 @@ Block PKCondition::getBlockWithConstants(
 {
     Block result
     {
-        { std::make_shared<ColumnConstUInt8>(1, 0), std::make_shared<DataTypeUInt8>(), "_dummy" }
+        { DataTypeUInt8().createColumnConstWithDefaultValue(1), std::make_shared<DataTypeUInt8>(), "_dummy" }
     };
 
-    const auto expr_for_constant_folding = ExpressionAnalyzer{query, context, nullptr, all_columns}
-        .getConstActions();
+    const auto expr_for_constant_folding = ExpressionAnalyzer{query, context, nullptr, all_columns}.getConstActions();
 
     expr_for_constant_folding->execute(result);
 
@@ -218,9 +257,13 @@ Block PKCondition::getBlockWithConstants(
 }
 
 
-PKCondition::PKCondition(ASTPtr & query, const Context & context, const NamesAndTypesList & all_columns,
-                         const SortDescription & sort_descr_, const Block & pk_sample_block_)
-    : sort_descr(sort_descr_), pk_sample_block(pk_sample_block_)
+PKCondition::PKCondition(
+    const SelectQueryInfo & query_info,
+    const Context & context,
+    const NamesAndTypesList & all_columns,
+    const SortDescription & sort_descr_,
+    const ExpressionActionsPtr & pk_expr_)
+    : sort_descr(sort_descr_), pk_expr(pk_expr_), prepared_sets(query_info.sets)
 {
     for (size_t i = 0; i < sort_descr.size(); ++i)
     {
@@ -232,10 +275,10 @@ PKCondition::PKCondition(ASTPtr & query, const Context & context, const NamesAnd
     /** Evaluation of expressions that depend only on constants.
       * For the index to be used, if it is written, for example `WHERE Date = toDate(now())`.
       */
-    Block block_with_constants = getBlockWithConstants(query, context, all_columns);
+    Block block_with_constants = getBlockWithConstants(query_info.query, context, all_columns);
 
     /// Trasform WHERE section to Reverse Polish notation
-    ASTSelectQuery & select = typeid_cast<ASTSelectQuery &>(*query);
+    const ASTSelectQuery & select = typeid_cast<const ASTSelectQuery &>(*query_info.query);
     if (select.where_expression)
     {
         traverseAST(select.where_expression, context, block_with_constants);
@@ -285,7 +328,7 @@ static bool getConstant(const ASTPtr & expr, Block & block_with_constants, Field
         out_type = block_with_constants.getByName(column_name).type;
         return true;
     }
-    else if (block_with_constants.has(column_name) && block_with_constants.getByName(column_name).column->isConst())
+    else if (block_with_constants.has(column_name) && block_with_constants.getByName(column_name).column->isColumnConst())
     {
         /// An expression which is dependent on constants only
         const auto & expr_info = block_with_constants.getByName(column_name);
@@ -297,7 +340,27 @@ static bool getConstant(const ASTPtr & expr, Block & block_with_constants, Field
         return false;
 }
 
-void PKCondition::traverseAST(ASTPtr & node, const Context & context, Block & block_with_constants)
+
+static void applyFunction(
+    const FunctionBasePtr & func,
+    const DataTypePtr & arg_type, const Field & arg_value,
+    DataTypePtr & res_type, Field & res_value)
+{
+    res_type = func->getReturnType();
+
+    Block block
+    {
+        { arg_type->createColumnConst(1, arg_value), arg_type, "x" },
+        { nullptr, res_type, "y" }
+    };
+
+    func->execute(block, {0}, 1);
+
+    block.safeGetByPosition(1).column->get(0, res_value);
+}
+
+
+void PKCondition::traverseAST(const ASTPtr & node, const Context & context, Block & block_with_constants)
 {
     RPNElement element;
 
@@ -314,7 +377,7 @@ void PKCondition::traverseAST(ASTPtr & node, const Context & context, Block & bl
                   * - in this case `n - 1` elements are added (where `n` is the number of arguments).
                   */
                 if (i != 0 || element.function == RPNElement::FUNCTION_NOT)
-                    rpn.push_back(element);
+                    rpn.emplace_back(std::move(element));
             }
 
             return;
@@ -326,9 +389,126 @@ void PKCondition::traverseAST(ASTPtr & node, const Context & context, Block & bl
         element.function = RPNElement::FUNCTION_UNKNOWN;
     }
 
-    rpn.push_back(element);
+    rpn.emplace_back(std::move(element));
 }
 
+
+bool PKCondition::canConstantBeWrappedByMonotonicFunctions(
+    const ASTPtr & node,
+    size_t & out_primary_key_column_num,
+    DataTypePtr & out_primary_key_column_type,
+    Field & out_value,
+    DataTypePtr & out_type)
+{
+    String expr_name = node->getColumnName();
+    const auto & sample_block = pk_expr->getSampleBlock();
+    if (!sample_block.has(expr_name))
+        return false;
+
+    bool found_transformation = false;
+    for (const ExpressionAction & a : pk_expr->getActions())
+    {
+        /** The primary key functional expression constraint may be inferred from a plain column in the expression.
+          * For example, if the primary key contains `toStartOfHour(Timestamp)` and query contains `WHERE Timestamp >= now()`,
+          * it can be assumed that if `toStartOfHour()` is monotonic on [now(), inf), the `toStartOfHour(Timestamp) >= toStartOfHour(now())`
+          * condition also holds, so the index may be used to select only parts satisfying this condition.
+          *
+          * To check the assumption, we'd need to assert that the inverse function to this transformation is also monotonic, however the
+          * inversion isn't exported (or even viable for not strictly monotonic functions such as `toStartOfHour()`).
+          * Instead, we can qualify only functions that do not transform the range (for example rounding),
+          * which while not strictly monotonic, are monotonic everywhere on the input range.
+          */
+        const auto & action = a.argument_names;
+        if (a.type == ExpressionAction::Type::APPLY_FUNCTION && action.size() == 1 && a.argument_names[0] == expr_name)
+        {
+            if (!a.function->hasInformationAboutMonotonicity())
+                return false;
+
+            // Range is irrelevant in this case
+            IFunction::Monotonicity monotonicity = a.function->getMonotonicityForRange(*out_type, Field(), Field());
+            if (!monotonicity.is_always_monotonic)
+                return false;
+
+            // Apply the next transformation step
+            DataTypePtr new_type;
+            applyFunction(a.function, out_type, out_value, new_type, out_value);
+            if (!new_type)
+                return false;
+
+            out_type.swap(new_type);
+            expr_name = a.result_name;
+
+            // Transformation results in a primary key expression, accept
+            auto it = pk_columns.find(expr_name);
+            if (pk_columns.end() != it)
+            {
+                out_primary_key_column_num = it->second;
+                out_primary_key_column_type = sample_block.getByName(it->first).type;
+                found_transformation = true;
+                break;
+            }
+        }
+    }
+
+    return found_transformation;
+}
+
+void PKCondition::getPKTuplePositionMapping(
+    const ASTPtr & node,
+    const Context & context,
+    std::vector<MergeTreeSetIndex::PKTuplePositionMapping> & indexes_mapping,
+    const size_t tuple_index,
+    size_t & out_primary_key_column_num)
+{
+    MergeTreeSetIndex::PKTuplePositionMapping index_mapping;
+    index_mapping.tuple_index = tuple_index;
+    DataTypePtr data_type;
+    if (isPrimaryKeyPossiblyWrappedByMonotonicFunctions(
+            node, context, index_mapping.pk_index,
+            data_type, index_mapping.functions))
+    {
+        indexes_mapping.push_back(index_mapping);
+        if (out_primary_key_column_num < index_mapping.pk_index)
+        {
+            out_primary_key_column_num = index_mapping.pk_index;
+        }
+    }
+}
+
+// Try to prepare PKTuplePositionMapping for tuples from IN expression.
+bool PKCondition::isTupleIndexable(
+    const ASTPtr & node,
+    const Context & context,
+    RPNElement & out,
+    const SetPtr & prepared_set,
+    size_t & out_primary_key_column_num)
+{
+    out_primary_key_column_num = 0;
+    const ASTFunction * node_tuple = typeid_cast<const ASTFunction *>(node.get());
+    std::vector<MergeTreeSetIndex::PKTuplePositionMapping> indexes_mapping;
+    if (node_tuple && node_tuple->name == "tuple")
+    {
+        size_t current_tuple_index = 0;
+        for (const auto & arg : node_tuple->arguments->children)
+        {
+            getPKTuplePositionMapping(arg, context, indexes_mapping, current_tuple_index++, out_primary_key_column_num);
+        }
+    }
+    else
+    {
+       getPKTuplePositionMapping(node, context, indexes_mapping, 0, out_primary_key_column_num);
+    }
+
+    if (indexes_mapping.empty())
+    {
+        return false;
+    }
+
+    out.set_index = std::make_shared<MergeTreeSetIndex>(
+        prepared_set->getSetElements(), std::move(indexes_mapping));
+
+    return true;
+}
 
 bool PKCondition::isPrimaryKeyPossiblyWrappedByMonotonicFunctions(
     const ASTPtr & node,
@@ -345,11 +525,14 @@ bool PKCondition::isPrimaryKeyPossiblyWrappedByMonotonicFunctions(
 
     for (auto it = chain_not_tested_for_monotonicity.rbegin(); it != chain_not_tested_for_monotonicity.rend(); ++it)
     {
-        FunctionPtr func = FunctionFactory::instance().tryGet((*it)->name, context);
+        auto func_builder = FunctionFactory::instance().tryGet((*it)->name, context);
+        ColumnsWithTypeAndName arguments{{ nullptr, primary_key_column_type, "" }};
+        auto func = func_builder->build(arguments);
+
         if (!func || !func->hasInformationAboutMonotonicity())
             return false;
 
-        primary_key_column_type = func->getReturnType({primary_key_column_type});
+        primary_key_column_type = func->getReturnType();
         out_functions_chain.push_back(func);
     }
 
@@ -357,7 +540,6 @@ bool PKCondition::isPrimaryKeyPossiblyWrappedByMonotonicFunctions(
 
     return true;
 }
-
 
 bool PKCondition::isPrimaryKeyPossiblyWrappedByMonotonicFunctionsImpl(
     const ASTPtr & node,
@@ -368,13 +550,14 @@ bool PKCondition::isPrimaryKeyPossiblyWrappedByMonotonicFunctionsImpl(
     /** By itself, the primary key column can be a functional expression. for example, `intHash32(UserID)`.
       * Therefore, use the full name of the expression for search.
       */
+    const auto & sample_block = pk_expr->getSampleBlock();
     String name = node->getColumnName();
 
     auto it = pk_columns.find(name);
     if (pk_columns.end() != it)
     {
         out_primary_key_column_num = it->second;
-        out_primary_key_column_type = pk_sample_block.getByName(name).type;
+        out_primary_key_column_type = sample_block.getByName(it->first).type;
         return true;
     }
 
@@ -411,16 +594,16 @@ static void castValueToType(const DataTypePtr & desired_type, Field & src_value,
     {
         throw Exception("Primary key expression contains comparison between inconvertible types: " +
             desired_type->getName() + " and " + src_type->getName() +
-            " inside " + DB::toString(node->range),
+            " inside " + queryToString(node),
             ErrorCodes::BAD_TYPE_OF_FIELD);
     }
 }
 
 
-bool PKCondition::atomFromAST(ASTPtr & node, const Context & context, Block & block_with_constants, RPNElement & out)
+bool PKCondition::atomFromAST(const ASTPtr & node, const Context & context, Block & block_with_constants, RPNElement & out)
 {
     /** Functions < > = != <= >= in `notIn`, where one argument is a constant, and the other is one of columns of primary key,
-      *  or itself, wrapped in a chain of possibly-monotone functions,
+      *  or itself, wrapped in a chain of possibly-monotonic functions,
       *  or constant expression - number.
       */
     Field const_value;
@@ -433,31 +616,53 @@ bool PKCondition::atomFromAST(ASTPtr & node, const Context & context, Block & bl
             return false;
 
         DataTypePtr key_expr_type;    /// Type of expression containing primary key column
-        size_t key_arg_pos;            /// Position of argument with primary key column (non-const argument)
+        size_t key_arg_pos;           /// Position of argument with primary key column (non-const argument)
         size_t key_column_num;        /// Number of a primary key column (inside sort_descr array)
         RPNElement::MonotonicFunctionsChain chain;
         bool is_set_const = false;
+        bool is_constant_transformed = false;
 
-        if (getConstant(args[1], block_with_constants, const_value, const_type)
+        if (prepared_sets.count(args[1].get())
+            && isTupleIndexable(args[0], context, out, prepared_sets[args[1].get()], key_column_num))
+        {
+            key_arg_pos = 0;
+            is_set_const = true;
+        }
+        else if (getConstant(args[1], block_with_constants, const_value, const_type)
             && isPrimaryKeyPossiblyWrappedByMonotonicFunctions(args[0], context, key_column_num, key_expr_type, chain))
         {
             key_arg_pos = 0;
+        }
+        else if (getConstant(args[1], block_with_constants, const_value, const_type)
+            && canConstantBeWrappedByMonotonicFunctions(args[0], key_column_num, key_expr_type, const_value, const_type))
+        {
+            key_arg_pos = 0;
+            is_constant_transformed = true;
         }
         else if (getConstant(args[0], block_with_constants, const_value, const_type)
             && isPrimaryKeyPossiblyWrappedByMonotonicFunctions(args[1], context, key_column_num, key_expr_type, chain))
         {
             key_arg_pos = 1;
         }
-        else if (typeid_cast<const ASTSet *>(args[1].get())
-            && isPrimaryKeyPossiblyWrappedByMonotonicFunctions(args[0], context, key_column_num, key_expr_type, chain))
+        else if (getConstant(args[0], block_with_constants, const_value, const_type)
+            &&  canConstantBeWrappedByMonotonicFunctions(args[1], key_column_num, key_expr_type, const_value, const_type))
         {
-            key_arg_pos = 0;
-            is_set_const = true;
+            key_arg_pos = 1;
+            is_constant_transformed = true;
         }
         else
             return false;
 
         std::string func_name = func->name;
+
+        /// Transformed constant must weaken the condition, for example "x > 5" must weaken to "round(x) >= 5"
+        if (is_constant_transformed)
+        {
+            if (func_name == "less")
+                func_name = "lessOrEquals";
+            else if (func_name == "greater")
+                func_name = "greaterOrEquals";
+        }
 
         /// Replace <const> <sign> <data> on to <data> <-sign> <const>
         if (key_arg_pos == 1)
@@ -484,7 +689,11 @@ bool PKCondition::atomFromAST(ASTPtr & node, const Context & context, Block & bl
         if (atom_it == std::end(atom_map))
             return false;
 
-        if (!is_set_const) /// Set args are already casted inside Set::createFromAST
+        bool cast_not_needed =
+            is_set_const /// Set args are already casted inside Set::createFromAST
+            || (key_expr_type->isNumber() && const_type->isNumber()); /// Numbers are accurately compared without cast.
+
+        if (!cast_not_needed)
             castValueToType(key_expr_type, const_value, const_type, node);
 
         return atom_it->second(out, const_value, node);
@@ -548,25 +757,6 @@ String PKCondition::toString() const
 }
 
 
-static void applyFunction(
-    FunctionPtr & func,
-    const DataTypePtr & arg_type, const Field & arg_value,
-    DataTypePtr & res_type, Field & res_value)
-{
-    res_type = func->getReturnType({arg_type});
-
-    Block block
-    {
-        { arg_type->createConstColumn(1, arg_value), arg_type, "x" },
-        { nullptr, res_type, "y" }
-    };
-
-    func->execute(block, {0}, 1);
-
-    block.safeGetByPosition(1).column->get(0, res_value);
-}
-
-
 /** Index is the value of primary key every `index_granularity` rows.
   * This value is called a "mark". That is, the index consists of marks.
   *
@@ -576,7 +766,7 @@ static void applyFunction(
   * A pair of marks specifies a segment with respect to the order over the tuples.
   * Denote it like this: [ x1 y1 z1 .. x2 y2 z2 ],
   *  where x1 y1 z1 - tuple - value of primary key in left border of segment;
-  *      x2 y2 z2 - tuple - value of primary key in right boundary of segment.
+  *        x2 y2 z2 - tuple - value of primary key in right boundary of segment.
   * In this section there are data between these marks.
   *
   * Or, the last mark specifies the range open on the right: [ a b c .. + inf )
@@ -695,7 +885,7 @@ bool PKCondition::mayBeTrueInRange(
 {
     std::vector<Range> key_ranges(used_key_size, Range());
 
-/*    std::cerr << "Checking for: [";
+/*  std::cerr << "Checking for: [";
     for (size_t i = 0; i != used_key_size; ++i)
         std::cerr << (i != 0 ? ", " : "") << applyVisitor(FieldVisitorToString(), left_pk[i]);
     std::cerr << " ... ";
@@ -714,7 +904,7 @@ bool PKCondition::mayBeTrueInRange(
     {
         auto res = mayBeTrueInRangeImpl(key_ranges, data_types);
 
-/*        std::cerr << "Parallelogram: ";
+/*      std::cerr << "Parallelogram: ";
         for (size_t i = 0, size = key_ranges.size(); i != size; ++i)
             std::cerr << (i != 0 ? " x " : "") << key_ranges[i].toString();
         std::cerr << ": " << res << "\n";*/
@@ -723,6 +913,42 @@ bool PKCondition::mayBeTrueInRange(
     });
 }
 
+std::optional<Range> PKCondition::applyMonotonicFunctionsChainToRange(
+    Range key_range,
+    RPNElement::MonotonicFunctionsChain & functions,
+    DataTypePtr current_type
+)
+{
+    for (auto & func : functions)
+    {
+        /// We check the monotonicity of each function on a specific range.
+        IFunction::Monotonicity monotonicity = func->getMonotonicityForRange(
+            *current_type.get(), key_range.left, key_range.right);
+
+        if (!monotonicity.is_monotonic)
+        {
+            return {};
+        }
+
+        /// Apply the function.
+        DataTypePtr new_type;
+        if (!key_range.left.isNull())
+            applyFunction(func, current_type, key_range.left, new_type, key_range.left);
+        if (!key_range.right.isNull())
+            applyFunction(func, current_type, key_range.right, new_type, key_range.right);
+
+        if (!new_type)
+        {
+            return {};
+        }
+
+        current_type.swap(new_type);
+
+        if (!monotonicity.is_positive)
+            key_range.swapLeftAndRight();
+    }
+    return key_range;
+}
 
 bool PKCondition::mayBeTrueInRangeImpl(const std::vector<Range> & key_ranges, const DataTypes & data_types) const
 {
@@ -735,89 +961,49 @@ bool PKCondition::mayBeTrueInRangeImpl(const std::vector<Range> & key_ranges, co
             rpn_stack.emplace_back(true, true);
         }
         else if (element.function == RPNElement::FUNCTION_IN_RANGE
-            || element.function == RPNElement::FUNCTION_NOT_IN_RANGE
-            || element.function == RPNElement::FUNCTION_IN_SET
-            || element.function == RPNElement::FUNCTION_NOT_IN_SET)
+            || element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
         {
             const Range * key_range = &key_ranges[element.key_column];
 
-            /// The case when the column is wrapped in a chain of possibly monotone functions.
-            Range key_range_transformed;
-            bool evaluation_is_not_possible = false;
+            /// The case when the column is wrapped in a chain of possibly monotonic functions.
+            Range transformed_range;
             if (!element.monotonic_functions_chain.empty())
             {
-                key_range_transformed = *key_range;
-                DataTypePtr current_type = data_types[element.key_column];
-                for (auto & func : element.monotonic_functions_chain)
-                {
-                    /// We check the monotonicity of each function on a specific range.
-                    IFunction::Monotonicity monotonicity = func->getMonotonicityForRange(
-                        *current_type.get(), key_range_transformed.left, key_range_transformed.right);
+                std::optional<Range> new_range = applyMonotonicFunctionsChainToRange(
+                    *key_range,
+                    element.monotonic_functions_chain,
+                    data_types[element.key_column]
+                );
 
-                /*    std::cerr << "Function " << func->getName() << " is " << (monotonicity.is_monotonic ? "" : "not ")
-                        << "monotonic " << (monotonicity.is_monotonic ? (monotonicity.is_positive ? "(positive) " : "(negative) ") : "")
-                        << "in range "
-                        << "[" << applyVisitor(FieldVisitorToString(), key_range_transformed.left)
-                        << ", " << applyVisitor(FieldVisitorToString(), key_range_transformed.right) << "]\n";*/
-
-                    if (!monotonicity.is_monotonic)
-                    {
-                        evaluation_is_not_possible = true;
-                        break;
-                    }
-
-                    /// Compute the function.
-                    DataTypePtr new_type;
-                    if (!key_range_transformed.left.isNull())
-                        applyFunction(func, current_type, key_range_transformed.left, new_type, key_range_transformed.left);
-                    if (!key_range_transformed.right.isNull())
-                        applyFunction(func, current_type, key_range_transformed.right, new_type, key_range_transformed.right);
-
-                    if (!new_type)
-                    {
-                        evaluation_is_not_possible = true;
-                        break;
-                    }
-
-                    current_type.swap(new_type);
-
-                    if (!monotonicity.is_positive)
-                        key_range_transformed.swapLeftAndRight();
-                }
-
-                if (evaluation_is_not_possible)
+                if (!new_range)
                 {
                     rpn_stack.emplace_back(true, true);
                     continue;
                 }
-
-                key_range = &key_range_transformed;
+                transformed_range = *new_range;
+                key_range = &transformed_range;
             }
 
-            if (element.function == RPNElement::FUNCTION_IN_RANGE
-                || element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
-            {
-                bool intersects = element.range.intersectsRange(*key_range);
-                bool contains = element.range.containsRange(*key_range);
+            bool intersects = element.range.intersectsRange(*key_range);
+            bool contains = element.range.containsRange(*key_range);
 
-                rpn_stack.emplace_back(intersects, !contains);
-                if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
+            rpn_stack.emplace_back(intersects, !contains);
+            if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
+                rpn_stack.back() = !rpn_stack.back();
+        }
+        else if (
+            element.function == RPNElement::FUNCTION_IN_SET
+            || element.function == RPNElement::FUNCTION_NOT_IN_SET)
+        {
+            auto in_func = typeid_cast<const ASTFunction *>(element.in_function.get());
+            const ASTs & args = typeid_cast<const ASTExpressionList &>(*in_func->arguments).children;
+            PreparedSets::const_iterator it = prepared_sets.find(args[1].get());
+            if (in_func && it != prepared_sets.end())
+            {
+                rpn_stack.emplace_back(element.set_index->mayBeTrueInRange(key_ranges, data_types));
+                if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
+                {
                     rpn_stack.back() = !rpn_stack.back();
-            }
-            else    /// Set
-            {
-                auto in_func = typeid_cast<const ASTFunction *>(element.in_function.get());
-                const ASTs & args = typeid_cast<const ASTExpressionList &>(*in_func->arguments).children;
-                auto ast_set = typeid_cast<const ASTSet *>(args[1].get());
-                if (in_func && ast_set)
-                {
-                    rpn_stack.push_back(ast_set->set->mayBeTrueInRange(*key_range));
-                    if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
-                        rpn_stack.back() = !rpn_stack.back();
-                }
-                else
-                {
-                    throw Exception("Set for IN is not created yet!", ErrorCodes::LOGICAL_ERROR);
                 }
             }
         }
@@ -852,7 +1038,7 @@ bool PKCondition::mayBeTrueInRangeImpl(const std::vector<Range> & key_ranges, co
     }
 
     if (rpn_stack.size() != 1)
-        throw Exception("Unexpected stack size in PkCondition::mayBeTrueInRange", ErrorCodes::LOGICAL_ERROR);
+        throw Exception("Unexpected stack size in PKCondition::mayBeTrueInRange", ErrorCodes::LOGICAL_ERROR);
 
     return rpn_stack[0].can_be_true;
 }
@@ -870,14 +1056,6 @@ bool PKCondition::mayBeTrueAfter(
     return mayBeTrueInRange(used_key_size, left_pk, nullptr, data_types, false);
 }
 
-
-static const ASTSet & inFunctionToSet(const ASTPtr & in_function)
-{
-    const auto & in_func = typeid_cast<const ASTFunction &>(*in_function);
-    const auto & args = typeid_cast<const ASTExpressionList &>(*in_func.arguments).children;
-    const auto & ast_set = typeid_cast<const ASTSet &>(*args[1]);
-    return ast_set;
-}
 
 String PKCondition::RPNElement::toString() const
 {
@@ -908,7 +1086,7 @@ String PKCondition::RPNElement::toString() const
         {
             ss << "(";
             print_wrapped_column(ss);
-            ss << (function == FUNCTION_IN_SET ? " in " : " notIn ") << inFunctionToSet(in_function).set->describe();
+            ss << (function == FUNCTION_IN_SET ? " in set" : " notIn set");
             ss << ")";
             return ss.str();
         }
@@ -991,6 +1169,5 @@ size_t PKCondition::getMaxKeyColumn() const
     }
     return res;
 }
-
 
 }

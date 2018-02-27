@@ -1,6 +1,7 @@
-#include <ext/map.hpp>
-#include <ext/range.hpp>
+#include <ext/map.h>
+#include <ext/range.h>
 #include <Dictionaries/ComplexKeyHashedDictionary.h>
+#include <Dictionaries/DictionaryBlockInputStream.h>
 
 
 namespace DB
@@ -20,6 +21,7 @@ ComplexKeyHashedDictionary::ComplexKeyHashedDictionary(
     : name{name}, dict_struct(dict_struct), source_ptr{std::move(source_ptr)}, dict_lifetime(dict_lifetime),
     require_nonempty(require_nonempty)
 {
+
     createAttributes();
 
     try
@@ -42,7 +44,7 @@ ComplexKeyHashedDictionary::ComplexKeyHashedDictionary(const ComplexKeyHashedDic
 
 #define DECLARE(TYPE)\
 void ComplexKeyHashedDictionary::get##TYPE(\
-    const std::string & attribute_name, const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types,\
+    const std::string & attribute_name, const Columns & key_columns, const DataTypes & key_types,\
     PaddedPODArray<TYPE> & out) const\
 {\
     dict_struct.validateKeyTypes(key_types);\
@@ -56,13 +58,14 @@ void ComplexKeyHashedDictionary::get##TYPE(\
     const auto null_value = std::get<TYPE>(attribute.null_values);\
     \
     getItemsNumber<TYPE>(attribute, key_columns,\
-        [&] (const std::size_t row, const auto value) { out[row] = value; },\
-        [&] (const std::size_t) { return null_value; });\
+        [&] (const size_t row, const auto value) { out[row] = value; },\
+        [&] (const size_t) { return null_value; });\
 }
 DECLARE(UInt8)
 DECLARE(UInt16)
 DECLARE(UInt32)
 DECLARE(UInt64)
+DECLARE(UInt128)
 DECLARE(Int8)
 DECLARE(Int16)
 DECLARE(Int32)
@@ -72,7 +75,7 @@ DECLARE(Float64)
 #undef DECLARE
 
 void ComplexKeyHashedDictionary::getString(
-    const std::string & attribute_name, const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types,
+    const std::string & attribute_name, const Columns & key_columns, const DataTypes & key_types,
     ColumnString * out) const
 {
     dict_struct.validateKeyTypes(key_types);
@@ -86,13 +89,13 @@ void ComplexKeyHashedDictionary::getString(
     const auto & null_value = StringRef{std::get<String>(attribute.null_values)};
 
     getItemsImpl<StringRef, StringRef>(attribute, key_columns,
-        [&] (const std::size_t row, const StringRef value) { out->insertData(value.data, value.size); },
-        [&] (const std::size_t) { return null_value; });
+        [&] (const size_t, const StringRef value) { out->insertData(value.data, value.size); },
+        [&] (const size_t) { return null_value; });
 }
 
 #define DECLARE(TYPE)\
 void ComplexKeyHashedDictionary::get##TYPE(\
-    const std::string & attribute_name, const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types,\
+    const std::string & attribute_name, const Columns & key_columns, const DataTypes & key_types,\
     const PaddedPODArray<TYPE> & def, PaddedPODArray<TYPE> & out) const\
 {\
     dict_struct.validateKeyTypes(key_types);\
@@ -104,13 +107,14 @@ void ComplexKeyHashedDictionary::get##TYPE(\
             ErrorCodes::TYPE_MISMATCH};\
     \
     getItemsNumber<TYPE>(attribute, key_columns,\
-        [&] (const std::size_t row, const auto value) { out[row] = value; },\
-        [&] (const std::size_t row) { return def[row]; });\
+        [&] (const size_t row, const auto value) { out[row] = value; },\
+        [&] (const size_t row) { return def[row]; });\
 }
 DECLARE(UInt8)
 DECLARE(UInt16)
 DECLARE(UInt32)
 DECLARE(UInt64)
+DECLARE(UInt128)
 DECLARE(Int8)
 DECLARE(Int16)
 DECLARE(Int32)
@@ -120,7 +124,7 @@ DECLARE(Float64)
 #undef DECLARE
 
 void ComplexKeyHashedDictionary::getString(
-    const std::string & attribute_name, const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types,
+    const std::string & attribute_name, const Columns & key_columns, const DataTypes & key_types,
     const ColumnString * const def, ColumnString * const out) const
 {
     dict_struct.validateKeyTypes(key_types);
@@ -132,13 +136,13 @@ void ComplexKeyHashedDictionary::getString(
             ErrorCodes::TYPE_MISMATCH};
 
     getItemsImpl<StringRef, StringRef>(attribute, key_columns,
-        [&] (const std::size_t row, const StringRef value) { out->insertData(value.data, value.size); },
-        [&] (const std::size_t row) { return def->getDataAt(row); });
+        [&] (const size_t, const StringRef value) { out->insertData(value.data, value.size); },
+        [&] (const size_t row) { return def->getDataAt(row); });
 }
 
 #define DECLARE(TYPE)\
 void ComplexKeyHashedDictionary::get##TYPE(\
-    const std::string & attribute_name, const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types,\
+    const std::string & attribute_name, const Columns & key_columns, const DataTypes & key_types,\
     const TYPE def, PaddedPODArray<TYPE> & out) const\
 {\
     dict_struct.validateKeyTypes(key_types);\
@@ -150,13 +154,14 @@ void ComplexKeyHashedDictionary::get##TYPE(\
             ErrorCodes::TYPE_MISMATCH};\
     \
     getItemsNumber<TYPE>(attribute, key_columns,\
-        [&] (const std::size_t row, const auto value) { out[row] = value; },\
-        [&] (const std::size_t) { return def; });\
+        [&] (const size_t row, const auto value) { out[row] = value; },\
+        [&] (const size_t) { return def; });\
 }
 DECLARE(UInt8)
 DECLARE(UInt16)
 DECLARE(UInt32)
 DECLARE(UInt64)
+DECLARE(UInt128)
 DECLARE(Int8)
 DECLARE(Int16)
 DECLARE(Int32)
@@ -166,7 +171,7 @@ DECLARE(Float64)
 #undef DECLARE
 
 void ComplexKeyHashedDictionary::getString(
-    const std::string & attribute_name, const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types,
+    const std::string & attribute_name, const Columns & key_columns, const DataTypes & key_types,
     const String & def, ColumnString * const out) const
 {
     dict_struct.validateKeyTypes(key_types);
@@ -178,11 +183,11 @@ void ComplexKeyHashedDictionary::getString(
             ErrorCodes::TYPE_MISMATCH};
 
     getItemsImpl<StringRef, StringRef>(attribute, key_columns,
-        [&] (const std::size_t row, const StringRef value) { out->insertData(value.data, value.size); },
-        [&] (const std::size_t) { return StringRef{def}; });
+        [&] (const size_t, const StringRef value) { out->insertData(value.data, value.size); },
+        [&] (const size_t) { return StringRef{def}; });
 }
 
-void ComplexKeyHashedDictionary::has(const ConstColumnPlainPtrs & key_columns, const DataTypes & key_types, PaddedPODArray<UInt8> & out) const
+void ComplexKeyHashedDictionary::has(const Columns & key_columns, const DataTypes & key_types, PaddedPODArray<UInt8> & out) const
 {
     dict_struct.validateKeyTypes(key_types);
 
@@ -194,6 +199,7 @@ void ComplexKeyHashedDictionary::has(const ConstColumnPlainPtrs & key_columns, c
         case AttributeUnderlyingType::UInt16: has<UInt16>(attribute, key_columns, out); break;
         case AttributeUnderlyingType::UInt32: has<UInt32>(attribute, key_columns, out); break;
         case AttributeUnderlyingType::UInt64: has<UInt64>(attribute, key_columns, out); break;
+        case AttributeUnderlyingType::UInt128: has<UInt128>(attribute, key_columns, out); break;
         case AttributeUnderlyingType::Int8: has<Int8>(attribute, key_columns, out); break;
         case AttributeUnderlyingType::Int16: has<Int16>(attribute, key_columns, out); break;
         case AttributeUnderlyingType::Int32: has<Int32>(attribute, key_columns, out); break;
@@ -227,7 +233,7 @@ void ComplexKeyHashedDictionary::loadData()
     stream->readPrefix();
 
     /// created upfront to avoid excess allocations
-    const auto keys_size = dict_struct.key.value().size();
+    const auto keys_size = dict_struct.key->size();
     StringRefs keys(keys_size);
 
     const auto attributes_size = attributes.size();
@@ -237,14 +243,16 @@ void ComplexKeyHashedDictionary::loadData()
         const auto rows = block.rows();
         element_count += rows;
 
-        const auto key_column_ptrs = ext::map<ConstColumnPlainPtrs>(ext::range(0, keys_size),
-            [&] (const std::size_t attribute_idx) {
-                return block.safeGetByPosition(attribute_idx).column.get();
+        const auto key_column_ptrs = ext::map<Columns>(ext::range(0, keys_size),
+            [&] (const size_t attribute_idx)
+            {
+                return block.safeGetByPosition(attribute_idx).column;
             });
 
-        const auto attribute_column_ptrs = ext::map<ConstColumnPlainPtrs>(ext::range(0, attributes_size),
-            [&] (const std::size_t attribute_idx) {
-                return block.safeGetByPosition(keys_size + attribute_idx).column.get();
+        const auto attribute_column_ptrs = ext::map<Columns>(ext::range(0, attributes_size),
+            [&] (const size_t attribute_idx)
+            {
+                return block.safeGetByPosition(keys_size + attribute_idx).column;
             });
 
         for (const auto row_idx : ext::range(0, rows))
@@ -298,6 +306,7 @@ void ComplexKeyHashedDictionary::calculateBytesAllocated()
             case AttributeUnderlyingType::UInt16: addAttributeSize<UInt16>(attribute); break;
             case AttributeUnderlyingType::UInt32: addAttributeSize<UInt32>(attribute); break;
             case AttributeUnderlyingType::UInt64: addAttributeSize<UInt64>(attribute); break;
+            case AttributeUnderlyingType::UInt128: addAttributeSize<UInt128>(attribute); break;
             case AttributeUnderlyingType::Int8: addAttributeSize<Int8>(attribute); break;
             case AttributeUnderlyingType::Int16: addAttributeSize<Int16>(attribute); break;
             case AttributeUnderlyingType::Int32: addAttributeSize<Int32>(attribute); break;
@@ -326,7 +335,7 @@ void ComplexKeyHashedDictionary::createAttributeImpl(Attribute & attribute, cons
 
 ComplexKeyHashedDictionary::Attribute ComplexKeyHashedDictionary::createAttributeWithType(const AttributeUnderlyingType type, const Field & null_value)
 {
-    Attribute attr{type};
+    Attribute attr{type, {}, {}, {}};
 
     switch (type)
     {
@@ -334,6 +343,7 @@ ComplexKeyHashedDictionary::Attribute ComplexKeyHashedDictionary::createAttribut
         case AttributeUnderlyingType::UInt16: createAttributeImpl<UInt16>(attr, null_value); break;
         case AttributeUnderlyingType::UInt32: createAttributeImpl<UInt32>(attr, null_value); break;
         case AttributeUnderlyingType::UInt64: createAttributeImpl<UInt64>(attr, null_value); break;
+        case AttributeUnderlyingType::UInt128: createAttributeImpl<UInt128>(attr, null_value); break;
         case AttributeUnderlyingType::Int8: createAttributeImpl<Int8>(attr, null_value); break;
         case AttributeUnderlyingType::Int16: createAttributeImpl<Int16>(attr, null_value); break;
         case AttributeUnderlyingType::Int32: createAttributeImpl<Int32>(attr, null_value); break;
@@ -356,7 +366,7 @@ ComplexKeyHashedDictionary::Attribute ComplexKeyHashedDictionary::createAttribut
 template <typename OutputType, typename ValueSetter, typename DefaultGetter>
 void ComplexKeyHashedDictionary::getItemsNumber(
     const Attribute & attribute,
-    const ConstColumnPlainPtrs & key_columns,
+    const Columns & key_columns,
     ValueSetter && set_value,
     DefaultGetter && get_default) const
 {
@@ -368,6 +378,7 @@ void ComplexKeyHashedDictionary::getItemsNumber(
     DISPATCH(UInt16)
     DISPATCH(UInt32)
     DISPATCH(UInt64)
+    DISPATCH(UInt128)
     DISPATCH(Int8)
     DISPATCH(Int16)
     DISPATCH(Int32)
@@ -382,7 +393,7 @@ void ComplexKeyHashedDictionary::getItemsNumber(
 template <typename AttributeType, typename OutputType, typename ValueSetter, typename DefaultGetter>
 void ComplexKeyHashedDictionary::getItemsImpl(
     const Attribute & attribute,
-    const ConstColumnPlainPtrs & key_columns,
+    const Columns & key_columns,
     ValueSetter && set_value,
     DefaultGetter && get_default) const
 {
@@ -399,7 +410,7 @@ void ComplexKeyHashedDictionary::getItemsImpl(
         const auto key = placeKeysInPool(i, key_columns, keys, temporary_keys_pool);
 
         const auto it = attr.find(key);
-        set_value(i, it != attr.end() ? it->second : get_default(i));
+        set_value(i, it != attr.end() ? static_cast<OutputType>(it->second) : get_default(i));
 
         /// free memory allocated for the key
         temporary_keys_pool.rollback(key.size);
@@ -425,6 +436,7 @@ bool ComplexKeyHashedDictionary::setAttributeValue(Attribute & attribute, const 
         case AttributeUnderlyingType::UInt16: return setAttributeValueImpl<UInt16>(attribute, key, value.get<UInt64>());
         case AttributeUnderlyingType::UInt32: return setAttributeValueImpl<UInt32>(attribute, key, value.get<UInt64>());
         case AttributeUnderlyingType::UInt64: return setAttributeValueImpl<UInt64>(attribute, key, value.get<UInt64>());
+        case AttributeUnderlyingType::UInt128: return setAttributeValueImpl<UInt128>(attribute, key, value.get<UInt128>());
         case AttributeUnderlyingType::Int8: return setAttributeValueImpl<Int8>(attribute, key, value.get<Int64>());
         case AttributeUnderlyingType::Int16: return setAttributeValueImpl<Int16>(attribute, key, value.get<Int64>());
         case AttributeUnderlyingType::Int32: return setAttributeValueImpl<Int32>(attribute, key, value.get<Int64>());
@@ -456,30 +468,30 @@ const ComplexKeyHashedDictionary::Attribute & ComplexKeyHashedDictionary::getAtt
 }
 
 StringRef ComplexKeyHashedDictionary::placeKeysInPool(
-    const std::size_t row, const ConstColumnPlainPtrs & key_columns, StringRefs & keys, Arena & pool)
+    const size_t row, const Columns & key_columns, StringRefs & keys, Arena & pool)
 {
     const auto keys_size = key_columns.size();
     size_t sum_keys_size{};
-    for (const auto i : ext::range(0, keys_size))
-    {
-        keys[i] = key_columns[i]->getDataAtWithTerminatingZero(row);
-        sum_keys_size += keys[i].size;
-    }
 
-    const auto res = pool.alloc(sum_keys_size);
-    auto place = res;
-
+    const char * block_start = nullptr;
     for (size_t j = 0; j < keys_size; ++j)
     {
-        memcpy(place, keys[j].data, keys[j].size);
-        place += keys[j].size;
+        keys[j] = key_columns[j]->serializeValueIntoArena(row, pool, block_start);
+        sum_keys_size += keys[j].size;
     }
 
-    return { res, sum_keys_size };
+    auto key_start = block_start;
+    for (size_t j = 0; j < keys_size; ++j)
+    {
+        keys[j].data = key_start;
+        key_start += keys[j].size;
+    }
+
+    return { block_start, sum_keys_size };
 }
 
 template <typename T>
-void ComplexKeyHashedDictionary::has(const Attribute & attribute, const ConstColumnPlainPtrs & key_columns, PaddedPODArray<UInt8> & out) const
+void ComplexKeyHashedDictionary::has(const Attribute & attribute, const Columns & key_columns, PaddedPODArray<UInt8> & out) const
 {
     const auto & attr = *std::get<ContainerPtrType<T>>(attribute.maps);
     const auto keys_size = key_columns.size();
@@ -501,5 +513,46 @@ void ComplexKeyHashedDictionary::has(const Attribute & attribute, const ConstCol
 
     query_count.fetch_add(rows, std::memory_order_relaxed);
 }
+
+std::vector<StringRef> ComplexKeyHashedDictionary::getKeys() const
+{
+    const Attribute & attribute = attributes.front();
+
+    switch (attribute.type)
+    {
+        case AttributeUnderlyingType::UInt8: return getKeys<UInt8>(attribute); break;
+        case AttributeUnderlyingType::UInt16: return getKeys<UInt16>(attribute); break;
+        case AttributeUnderlyingType::UInt32: return getKeys<UInt32>(attribute); break;
+        case AttributeUnderlyingType::UInt64: return getKeys<UInt64>(attribute); break;
+        case AttributeUnderlyingType::UInt128: return getKeys<UInt128>(attribute); break;
+        case AttributeUnderlyingType::Int8: return getKeys<Int8>(attribute); break;
+        case AttributeUnderlyingType::Int16: return getKeys<Int16>(attribute); break;
+        case AttributeUnderlyingType::Int32: return getKeys<Int32>(attribute); break;
+        case AttributeUnderlyingType::Int64: return getKeys<Int64>(attribute); break;
+        case AttributeUnderlyingType::Float32: return getKeys<Float32>(attribute); break;
+        case AttributeUnderlyingType::Float64: return getKeys<Float64>(attribute); break;
+        case AttributeUnderlyingType::String: return getKeys<StringRef>(attribute); break;
+    }
+    return {};
+}
+
+template <typename T>
+std::vector<StringRef> ComplexKeyHashedDictionary::getKeys(const Attribute & attribute) const
+{
+    const ContainerType<T> & attr = *std::get<ContainerPtrType<T>>(attribute.maps);
+    std::vector<StringRef> keys;
+    keys.reserve(attr.size());
+    for (const auto & key : attr)
+        keys.push_back(key.first);
+
+    return keys;
+}
+
+BlockInputStreamPtr ComplexKeyHashedDictionary::getBlockInputStream(const Names & column_names, size_t max_block_size) const
+{
+    using BlockInputStreamType = DictionaryBlockInputStream<ComplexKeyHashedDictionary, UInt64>;
+    return std::make_shared<BlockInputStreamType>(shared_from_this(), max_block_size, getKeys(), column_names);
+}
+
 
 }

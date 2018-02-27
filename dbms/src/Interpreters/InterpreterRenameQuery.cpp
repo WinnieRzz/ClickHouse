@@ -1,15 +1,17 @@
 #include <Parsers/ASTRenameQuery.h>
 #include <Databases/IDatabase.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/InterpreterRenameQuery.h>
 #include <Storages/IStorage.h>
-
+#include <Interpreters/DDLWorker.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
 {
 
 
-InterpreterRenameQuery::InterpreterRenameQuery(ASTPtr query_ptr_, Context & context_)
+InterpreterRenameQuery::InterpreterRenameQuery(const ASTPtr & query_ptr_, Context & context_)
     : query_ptr(query_ptr_), context(context_)
 {
 }
@@ -17,7 +19,7 @@ InterpreterRenameQuery::InterpreterRenameQuery(ASTPtr query_ptr_, Context & cont
 
 struct RenameDescription
 {
-    RenameDescription(const ASTRenameQuery::Element & elem, const String & path, const String & current_database) :
+    RenameDescription(const ASTRenameQuery::Element & elem, const String & current_database) :
         from_database_name(elem.from.database.empty() ? current_database : elem.from.database),
         from_table_name(elem.from.table),
         to_database_name(elem.to.database.empty() ? current_database : elem.to.database),
@@ -34,10 +36,13 @@ struct RenameDescription
 
 BlockIO InterpreterRenameQuery::execute()
 {
+    ASTRenameQuery & rename = typeid_cast<ASTRenameQuery &>(*query_ptr);
+
+    if (!rename.cluster.empty())
+        return executeDDLQueryOnCluster(query_ptr, context);
+
     String path = context.getPath();
     String current_database = context.getCurrentDatabase();
-
-    ASTRenameQuery & rename = typeid_cast<ASTRenameQuery &>(*query_ptr);
 
     /** In case of error while renaming, it is possible that only part of tables was renamed
       *  or we will be in inconsistent state. (It is worth to be fixed.)
@@ -68,7 +73,7 @@ BlockIO InterpreterRenameQuery::execute()
 
     for (const auto & elem : rename.elements)
     {
-        descriptions.emplace_back(elem, path, current_database);
+        descriptions.emplace_back(elem, current_database);
 
         UniqueTableName from(descriptions.back().from_database_name, descriptions.back().from_table_name);
         UniqueTableName to(descriptions.back().to_database_name, descriptions.back().to_table_name);
@@ -90,12 +95,12 @@ BlockIO InterpreterRenameQuery::execute()
                     "Some table right now is being renamed to " + to.database_name + "." + to.table_name));
     }
 
-    std::vector<TableFullWriteLockPtr> locks;
+    std::vector<TableFullWriteLock> locks;
     locks.reserve(unique_tables_from.size());
 
     for (const auto & names : unique_tables_from)
         if (auto table = context.tryGetTable(names.database_name, names.table_name))
-            locks.emplace_back(table->lockForAlter());
+            locks.emplace_back(table->lockForAlter(__PRETTY_FUNCTION__));
 
     /** All tables are locked. If there are more than one rename in chain,
       *  we need to hold global lock while doing all renames. Order matters to avoid deadlocks.
@@ -113,7 +118,7 @@ BlockIO InterpreterRenameQuery::execute()
         context.assertTableDoesntExist(elem.to_database_name, elem.to_table_name);
 
         context.getDatabase(elem.from_database_name)->renameTable(
-            context, elem.from_table_name, *context.getDatabase(elem.to_database_name), elem.to_table_name, context.getSettingsRef());
+            context, elem.from_table_name, *context.getDatabase(elem.to_database_name), elem.to_table_name);
     }
 
     return {};

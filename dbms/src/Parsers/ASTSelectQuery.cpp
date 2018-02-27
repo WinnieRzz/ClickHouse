@@ -1,4 +1,4 @@
-#include <Core/FieldVisitors.h>
+#include <Common/FieldVisitors.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTAsterisk.h>
@@ -16,19 +16,15 @@ namespace ErrorCodes
 {
     extern const int UNION_ALL_COLUMN_ALIAS_MISMATCH;
     extern const int UNION_ALL_RESULT_STRUCTURES_MISMATCH;
-    extern const int UNKNOWN_IDENTIFIER;
     extern const int LOGICAL_ERROR;
+    extern const int THERE_IS_NO_COLUMN;
 }
 
-
-ASTSelectQuery::ASTSelectQuery(const StringRange range_) : ASTQueryWithOutput(range_)
-{
-}
 
 bool ASTSelectQuery::hasArrayJoin(const ASTPtr & ast)
 {
     if (const ASTFunction * function = typeid_cast<const ASTFunction *>(&*ast))
-        if (function->kind == ASTFunction::ARRAY_JOIN)
+        if (function->name == "arrayJoin")
             return true;
 
     for (const auto & child : ast->children)
@@ -73,68 +69,74 @@ void ASTSelectQuery::renameColumns(const ASTSelectQuery & source)
 
 void ASTSelectQuery::rewriteSelectExpressionList(const Names & required_column_names)
 {
+    /// All columns are kept if we have DISTINCT.
+    if (distinct)
+        return;
+
+    /** Always keep columns that contain arrayJoin inside.
+      * In addition, keep all columns in 'required_column_names'.
+      * If SELECT has at least one asterisk, replace it with the rest of required_column_names
+      *  and ignore all other asterisks.
+      * We must keep columns in same related order.
+      */
+
+    /// Analyze existing expression list.
+
+    using ASTAndPosition = std::pair<ASTPtr, size_t>;
+
+    std::map<String, ASTAndPosition> columns_with_array_join;
+    std::map<String, ASTAndPosition> other_required_columns_in_select;
+    ASTAndPosition asterisk;
+
+    size_t position = 0;
+    for (const auto & child : select_expression_list->children)
+    {
+        if (typeid_cast<const ASTAsterisk *>(child.get()))
+        {
+            if (!asterisk.first)
+                asterisk = { child, position };
+        }
+        else
+        {
+            auto name = child->getAliasOrColumnName();
+
+            if (hasArrayJoin(child))
+                columns_with_array_join[name] = { child, position };
+            else if (required_column_names.end() != std::find(required_column_names.begin(), required_column_names.end(), name))
+                other_required_columns_in_select[name] = { child, position };
+        }
+        ++position;
+    }
+
+    /// Create a new expression list.
+
+    std::vector<ASTAndPosition> new_children;
+
+    for (const auto & name_child : other_required_columns_in_select)
+        new_children.push_back(name_child.second);
+
+    for (const auto & name_child : columns_with_array_join)
+        new_children.push_back(name_child.second);
+
+    for (const auto & name : required_column_names)
+    {
+        if (!other_required_columns_in_select.count(name) && !columns_with_array_join.count(name))
+        {
+            if (asterisk.first)
+                new_children.push_back({ std::make_shared<ASTIdentifier>(name), asterisk.second });
+            else
+                throw Exception("SELECT query doesn't have required column: " + backQuoteIfNeed(name), ErrorCodes::THERE_IS_NO_COLUMN);
+        }
+    }
+
+    std::sort(new_children.begin(), new_children.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+
     ASTPtr result = std::make_shared<ASTExpressionList>();
-    ASTs asts = select_expression_list->children;
 
-    /// Create a mapping.
+    for (const auto & child : new_children)
+        result->children.push_back(child.first);
 
-    /// The element of mapping.
-    struct Arrow
-    {
-        Arrow() = default;
-        Arrow(size_t to_position_) :
-            to_position(to_position_), is_selected(true)
-        {
-        }
-        size_t to_position = 0;
-        bool is_selected = false;
-    };
-
-    /// Mapping of one SELECT expression to another.
-    using Mapping = std::vector<Arrow>;
-
-    Mapping mapping(asts.size());
-
-    /// On which position in the SELECT expression is the corresponding column from `column_names`.
-    std::vector<size_t> positions_of_required_columns(required_column_names.size());
-
-    /// We will not throw out expressions that contain the `arrayJoin` function.
-    for (size_t i = 0; i < asts.size(); ++i)
-    {
-        if (hasArrayJoin(asts[i]))
-            mapping[i] = Arrow(i);
-    }
-
-    for (size_t i = 0; i < required_column_names.size(); ++i)
-    {
-        size_t j = 0;
-        for (; j < asts.size(); ++j)
-        {
-            if (asts[j]->getAliasOrColumnName() == required_column_names[i])
-            {
-                positions_of_required_columns[i] = j;
-                break;
-            }
-        }
-        if (j == asts.size())
-            throw Exception("Error while rewriting expression list for select query."
-                " Could not find alias: " + required_column_names[i],
-                DB::ErrorCodes::UNKNOWN_IDENTIFIER);
-    }
-
-    std::vector<size_t> positions_of_required_columns_in_subquery_order = positions_of_required_columns;
-    std::sort(positions_of_required_columns_in_subquery_order.begin(), positions_of_required_columns_in_subquery_order.end());
-
-    for (size_t i = 0; i < required_column_names.size(); ++i)
-        mapping[positions_of_required_columns_in_subquery_order[i]] = Arrow(positions_of_required_columns[i]);
-
-
-    /// Construct a new expression.
-    for (const auto & arrow : mapping)
-    {
-        if (arrow.is_selected)
-            result->children.push_back(asts[arrow.to_position]->clone());
-    }
+    /// Replace expression list in the query.
 
     for (auto & child : children)
     {
@@ -147,9 +149,9 @@ void ASTSelectQuery::rewriteSelectExpressionList(const Names & required_column_n
     select_expression_list = result;
 
     /** NOTE: It might seem that we could spoil the query by throwing an expression with an alias that is used somewhere else.
-        *       This can not happen, because this method is always called for a query, for which ExpressionAnalyzer was created at least once,
-        *       which ensures that all aliases in it are already set. Not quite obvious logic.
-        */
+      * This can not happen, because this method is always called for a query, for which ExpressionAnalyzer was created at least once,
+      * which ensures that all aliases in it are already set. Not quite obvious logic.
+      */
 }
 
 ASTPtr ASTSelectQuery::clone() const
@@ -173,7 +175,7 @@ ASTPtr ASTSelectQuery::clone() const
     return ptr;
 }
 
-ASTPtr ASTSelectQuery::cloneFirstSelect() const
+std::shared_ptr<ASTSelectQuery> ASTSelectQuery::cloneFirstSelect() const
 {
     auto res = cloneImpl(false);
     res->prev_union_all = nullptr;
@@ -189,7 +191,7 @@ std::shared_ptr<ASTSelectQuery> ASTSelectQuery::cloneImpl(bool traverse_union_al
 
     /** NOTE Members must clone exactly in the same order,
         *  in which they were inserted into `children` in ParserSelectQuery.
-        * This is important because of the children's names the identifier (getTreeID) is compiled,
+        * This is important because of the children's names the identifier (getTreeHash) is compiled,
         *  which can be used for column identifiers in the case of subqueries in the IN statement.
         * For distributed query processing, in case one of the servers is localhost and the other one is not,
         *  localhost query is executed within the process and is cloned,
@@ -197,6 +199,7 @@ std::shared_ptr<ASTSelectQuery> ASTSelectQuery::cloneImpl(bool traverse_union_al
         * And if the cloning order does not match the parsing order,
         *  then different servers will get different identifiers.
         */
+    CLONE(with_expression_list)
     CLONE(select_expression_list)
     CLONE(tables)
     CLONE(prewhere_expression)
@@ -231,6 +234,15 @@ void ASTSelectQuery::formatQueryImpl(const FormatSettings & s, FormatState & sta
     frame.current_select = this;
     frame.need_parens = false;
     std::string indent_str = s.one_line ? "" : std::string(4 * frame.indent, ' ');
+
+    if (with_expression_list)
+    {
+        s.ostr << (s.hilite ? hilite_keyword : "") << indent_str << "WITH " << (s.hilite ? hilite_none : "");
+        s.one_line
+            ? with_expression_list->formatImpl(s, state, frame)
+            : typeid_cast<const ASTExpressionList &>(*with_expression_list).formatImplMultiline(s, state, frame);
+        s.ostr << s.nl_or_ws;
+    }
 
     s.ostr << (s.hilite ? hilite_keyword : "") << indent_str << "SELECT " << (distinct ? "DISTINCT " : "") << (s.hilite ? hilite_none : "");
 
@@ -305,15 +317,7 @@ void ASTSelectQuery::formatQueryImpl(const FormatSettings & s, FormatState & sta
     if (settings)
     {
         s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "SETTINGS " << (s.hilite ? hilite_none : "");
-
-        const ASTSetQuery & ast_set = typeid_cast<const ASTSetQuery &>(*settings);
-        for (ASTSetQuery::Changes::const_iterator it = ast_set.changes.begin(); it != ast_set.changes.end(); ++it)
-        {
-            if (it != ast_set.changes.begin())
-                s.ostr << ", ";
-
-            s.ostr << it->name << " = " << applyVisitor(FieldVisitorToString(), it->value);
-        }
+        settings->formatImpl(s, state, frame);
     }
 
     if (next_union_all)
@@ -522,11 +526,11 @@ void ASTSelectQuery::setDatabaseIfNeeded(const String & database_name)
 
     if (table_expression->database_and_table_name->children.empty())
     {
-        ASTPtr database = std::make_shared<ASTIdentifier>(StringRange(), database_name, ASTIdentifier::Database);
+        ASTPtr database = std::make_shared<ASTIdentifier>(database_name, ASTIdentifier::Database);
         ASTPtr table = table_expression->database_and_table_name;
 
         const String & old_name = static_cast<ASTIdentifier &>(*table_expression->database_and_table_name).name;
-        table_expression->database_and_table_name = std::make_shared<ASTIdentifier>(StringRange(), database_name + "." + old_name, ASTIdentifier::Table);
+        table_expression->database_and_table_name = std::make_shared<ASTIdentifier>(database_name + "." + old_name, ASTIdentifier::Table);
         table_expression->database_and_table_name->children = {database, table};
     }
     else if (table_expression->database_and_table_name->children.size() != 2)
@@ -553,20 +557,18 @@ void ASTSelectQuery::replaceDatabaseAndTable(const String & database_name, const
         table_expression = table_expr.get();
     }
 
-    ASTPtr table = std::make_shared<ASTIdentifier>(StringRange(), table_name, ASTIdentifier::Table);
+    ASTPtr table = std::make_shared<ASTIdentifier>(table_name, ASTIdentifier::Table);
 
     if (!database_name.empty())
     {
-        ASTPtr database = std::make_shared<ASTIdentifier>(StringRange(), database_name, ASTIdentifier::Database);
+        ASTPtr database = std::make_shared<ASTIdentifier>(database_name, ASTIdentifier::Database);
 
-        table_expression->database_and_table_name = std::make_shared<ASTIdentifier>(
-            StringRange(), database_name + "." + table_name, ASTIdentifier::Table);
+        table_expression->database_and_table_name = std::make_shared<ASTIdentifier>(database_name + "." + table_name, ASTIdentifier::Table);
         table_expression->database_and_table_name->children = {database, table};
     }
     else
     {
-        table_expression->database_and_table_name = std::make_shared<ASTIdentifier>(
-            StringRange(), table_name, ASTIdentifier::Table);
+        table_expression->database_and_table_name = std::make_shared<ASTIdentifier>(table_name, ASTIdentifier::Table);
     }
 }
 
